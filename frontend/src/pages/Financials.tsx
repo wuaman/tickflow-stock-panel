@@ -4,6 +4,7 @@ import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { useCapabilities } from '@/lib/useSharedQueries'
 import { useFinancialStatus, useFinancialSync } from '@/lib/useFinancials'
+import { api } from '@/lib/api'
 import { StockFinancialSearch } from '@/components/financials/StockFinancialSearch'
 import { StockFinancialDetail } from '@/components/financials/StockFinancialDetail'
 import { ReportHistoryPanel } from '@/components/financials/ReportHistoryPanel'
@@ -97,13 +98,26 @@ export function Financials() {
     )
   }
 
-  const handleSync = (table: string) => {
+  // 同步范围: watchlist=仅自选股(秒级, 不触发全市场限流); all=全市场
+  const [scope, setScope] = useState<'watchlist' | 'all'>('watchlist')
+
+  const handleSync = async (table: string) => {
     // 防重复点击:syncing 中不再触发(后端 trigger 也有 _is_syncing 兜底)
     if (syncing) return
+    // watchlist 范围: 先检查自选股是否为空, 避免发起无意义同步
+    if (scope === 'watchlist') {
+      try {
+        const wl = await api.watchlistList()
+        if (!wl.symbols?.length) {
+          toast('自选股为空,请先在「自选」页添加股票后再同步', 'error')
+          return
+        }
+      } catch { /* 查询失败不阻塞, 让后端兜底 */ }
+    }
     // 记录开始时间: 全量同步判断所有财务表, 单表同步只判断这一张
     setSyncStartedAt(Date.now())
     setSyncSingleTable(table === 'all' ? null : table)
-    syncMut.mutate(table, {
+    syncMut.mutate({ table, scope }, {
       onSuccess: (r) => {
         // 后端 trigger 立即返回 started 状态;若被防并发跳过(已有同步在进行),
         // 给用户明确反馈,并清空本次误设的记录。
@@ -163,6 +177,21 @@ export function Financials() {
         right={
           <div className="flex items-center gap-2">
             <LastStockChip stock={lastStock} onSelect={pick} />
+            {/* 同步范围切换: 自选股(秒级, 推荐) / 全市场(慢, 易触发上游限流) */}
+            <div className="flex items-center rounded-btn border border-border bg-surface p-0.5 text-[11px]" title="选择财务同步范围">
+              {(['watchlist', 'all'] as const).map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setScope(s)}
+                  disabled={syncing}
+                  className={`px-2 py-1 rounded-btn transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                    scope === s ? 'bg-accent/20 text-accent font-medium' : 'text-muted hover:text-foreground'
+                  }`}
+                >
+                  {s === 'watchlist' ? '自选股' : '全市场'}
+                </button>
+              ))}
+            </div>
             {syncing && (
               <span className="text-xs text-accent/80 flex items-center gap-1.5">
                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -177,7 +206,7 @@ export function Financials() {
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-accent/25 to-accent/10 border border-accent/30 text-accent text-xs font-medium hover:from-accent/35 hover:to-accent/20 transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed"
               onClick={() => handleSync('all')}
               disabled={syncing}
-              title={syncing ? '正在同步，请稍候…' : '同步全部财务表'}
+              title={syncing ? '正在同步，请稍候…' : `同步全部财务表 (${scope === 'watchlist' ? '仅自选股' : '全市场'})`}
             >
               {syncing
                 ? <Loader2 className="h-3.5 w-3.5 animate-spin" />

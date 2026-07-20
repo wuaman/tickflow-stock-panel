@@ -31,7 +31,9 @@ def extract_rows(payload: Any, response_path: str = "") -> list[dict]:
 def map_rows(rows: list[dict], field_map: dict[str, str]) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame()
-    df = pl.DataFrame(rows)
+    # infer_schema_length=None: 扫描全部行推断 schema, 避免上游(如东方财富)返回值
+    # 前 100 行为 null、后续行才出现数值时, 按首行推断 Null 类型后追加数值崩溃。
+    df = pl.DataFrame(rows, infer_schema_length=None)
     rename = {src: dst for src, dst in field_map.items() if src in df.columns and src != dst}
     if rename:
         df = df.rename(rename)

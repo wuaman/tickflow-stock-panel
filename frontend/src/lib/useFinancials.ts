@@ -68,7 +68,8 @@ export function useFinancialShares(symbol?: string) {
 export function useFinancialSync() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (table: string) => api.financialSync(table),
+    mutationFn: ({ table, scope }: { table: string; scope: 'all' | 'watchlist' }) =>
+      api.financialSync(table, scope),
     // 点击瞬间立即刷新 status: 让后端 is_syncing=True 马上反映到 UI,
     // 避免 mutation 阻塞(全量同步需数分钟)期间界面无变化。
     onMutate: () => {

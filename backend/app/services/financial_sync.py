@@ -42,6 +42,37 @@ def _get_symbols(data_dir: Path) -> list[str]:
         return []
 
 
+def _get_watchlist_symbols() -> list[str]:
+    """从自选股表获取标的列表 (仅 symbol)。
+
+    用于「只同步自选股财报」——非全市场拉取, 规避上游 (东方财富等) 限流/封 IP。
+    """
+    try:
+        from app.services import watchlist
+        rows = watchlist.list_symbols()
+        return [str(r["symbol"]).strip().upper() for r in rows if r.get("symbol")]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取自选股失败: %s", e)
+        return []
+
+
+def _resolve_symbols(data_dir: Path, scope: str | None) -> tuple[list[str], str]:
+    """按 scope 解析要同步的标的列表, 返回 (symbols, 实际生效的 scope)。
+
+    scope:
+      None / "all"      → 全市场 instruments
+      "watchlist"       → 仅自选股; 自选股为空时返回空列表 (不回退全量, 避免误触发全市场拉取)
+    """
+    scope = (scope or "all").lower()
+    if scope == "watchlist":
+        syms = _get_watchlist_symbols()
+        if not syms:
+            logger.warning("scope=watchlist 但自选股为空, 跳过同步 (不回退全量)")
+            return [], "watchlist"
+        return syms, "watchlist"
+    return _get_symbols(data_dir), "all"
+
+
 def _financial_is_custom() -> bool:
     """当前财务数据源是否走 custom (用于绕过 TickFlow Expert 套餐门槛)。"""
     from app.services import preferences
@@ -202,43 +233,46 @@ def _sync_history_table_for_symbols(
     return _write_table(table, merged, data_dir)
 
 
-def sync_metrics(data_dir: Path, capset: CapabilitySet) -> int:
-    """同步核心财务指标 (metrics), 历史各期累积保留。"""
-    symbols = _get_symbols(data_dir)
+def sync_metrics(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
+    """同步核心财务指标 (metrics), 历史各期累积保留。scope=watchlist 仅同步自选股。"""
+    symbols, _ = _resolve_symbols(data_dir, scope)
     return _sync_history_table_for_symbols("metrics", symbols, data_dir, capset)
 
 
-def sync_income(data_dir: Path, capset: CapabilitySet) -> int:
-    """同步利润表, 历史各期累积保留。"""
-    symbols = _get_symbols(data_dir)
+def sync_income(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
+    """同步利润表, 历史各期累积保留。scope=watchlist 仅同步自选股。"""
+    symbols, _ = _resolve_symbols(data_dir, scope)
     return _sync_history_table_for_symbols("income", symbols, data_dir, capset)
 
 
-def sync_balance_sheet(data_dir: Path, capset: CapabilitySet) -> int:
-    """同步资产负债表, 历史各期累积保留。"""
-    symbols = _get_symbols(data_dir)
+def sync_balance_sheet(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
+    """同步资产负债表, 历史各期累积保留。scope=watchlist 仅同步自选股。"""
+    symbols, _ = _resolve_symbols(data_dir, scope)
     return _sync_history_table_for_symbols("balance_sheet", symbols, data_dir, capset)
 
 
-def sync_cash_flow(data_dir: Path, capset: CapabilitySet) -> int:
-    """同步现金流量表, 历史各期累积保留。"""
-    symbols = _get_symbols(data_dir)
+def sync_cash_flow(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
+    """同步现金流量表, 历史各期累积保留。scope=watchlist 仅同步自选股。"""
+    symbols, _ = _resolve_symbols(data_dir, scope)
     return _sync_history_table_for_symbols("cash_flow", symbols, data_dir, capset)
 
 
-def sync_shares(data_dir: Path, capset: CapabilitySet) -> int:
-    """同步历史股本表。"""
-    symbols = _get_symbols(data_dir)
+def sync_shares(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
+    """同步历史股本表。scope=watchlist 仅同步自选股。"""
+    symbols, _ = _resolve_symbols(data_dir, scope)
     return _sync_history_table_for_symbols("shares", symbols, data_dir, capset)
 
 
-def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
-    """同步所有财务表。返回 {table: rows}。"""
+def sync_all(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> dict[str, int]:
+    """同步所有财务表。返回 {table: rows}。scope=watchlist 仅同步自选股 (增量, 不冲掉其他股票)。"""
     if not capset.has(Cap.FINANCIAL) and not _financial_is_custom():
         logger.info("sync_all financials skipped: no FINANCIAL capability")
         return {}
 
-    symbols = _get_symbols(data_dir)
+    symbols, scope = _resolve_symbols(data_dir, scope)
+    if not symbols:
+        logger.info("sync_all skipped: no symbols (scope=%s)", scope)
+        return {}
     results: dict[str, int] = {}
     for table in FINANCIAL_TABLES:
         results[table] = _sync_history_table_for_symbols(
@@ -412,10 +446,11 @@ class FinancialScheduler:
         except asyncio.CancelledError:
             pass
 
-    def _run_body(self, table: str | None) -> dict[str, int]:
+    def _run_body(self, table: str | None, scope: str = "all") -> dict[str, int]:
         """同步逻辑本体(不加锁,假设调用方已持有 _is_syncing)。
 
         table=None 同步全部财务表;否则只同步指定表。
+        scope="watchlist" 仅同步自选股 (增量, 不冲掉其他股票)。
         每张表完成立即更新 last_sync,让前端轮询 /status 能看到进度递增。
         """
         if table:
@@ -428,11 +463,14 @@ class FinancialScheduler:
             }.get(table)
             if not fn:
                 return {}
-            rows = fn(self._data_dir, self._capset)
+            rows = fn(self._data_dir, self._capset, scope=scope)
             self._record_sync(table)
             return {table: rows}
         # 全部同步
-        symbols = _get_symbols(self._data_dir)
+        symbols, scope = _resolve_symbols(self._data_dir, scope)
+        if not symbols:
+            logger.info("financial sync skipped: no symbols (scope=%s)", scope)
+            return {}
         result: dict[str, int] = {}
         for t in FINANCIAL_TABLES:
             result[t] = _sync_history_table_for_symbols(
@@ -442,7 +480,7 @@ class FinancialScheduler:
         _refresh_financials_views(self._data_dir)
         return result
 
-    def run_now(self, table: str | None = None) -> dict[str, int]:
+    def run_now(self, table: str | None = None, scope: str = "all") -> dict[str, int]:
         """同步执行一次同步(阻塞调用线程)。
 
         ⚠ 全量同步需数分钟,务必在后台线程调用,不要直接在 HTTP 请求线程里阻塞,
@@ -460,12 +498,12 @@ class FinancialScheduler:
                 return {"_skipped": 1}
             self._is_syncing = True
         try:
-            return self._run_body(table)
+            return self._run_body(table, scope=scope)
         finally:
             with self._lock:
                 self._is_syncing = False
 
-    def trigger(self, table: str | None = None) -> dict[str, int]:
+    def trigger(self, table: str | None = None, scope: str = "all") -> dict[str, int]:
         """触发一次同步(非阻塞,立即返回)。
 
         在后台线程执行同步体,HTTP 请求无需等待。
@@ -488,7 +526,7 @@ class FinancialScheduler:
 
         def _bg() -> None:
             try:
-                self._run_body(table)
+                self._run_body(table, scope=scope)
             except Exception as e:  # noqa: BLE001
                 logger.exception("background financial sync failed: %s", e)
             finally:
@@ -497,7 +535,10 @@ class FinancialScheduler:
 
         t = threading.Thread(target=_bg, name="financial-sync", daemon=True)
         t.start()
-        logger.info("financial sync triggered in background: table=%s", table or "all")
+        logger.info(
+            "financial sync triggered in background: table=%s scope=%s",
+            table or "all", scope,
+        )
         return {"started": True}
 
     @property
