@@ -1,5 +1,9 @@
 # Phase 0 单 service:FastAPI 启动后既跑 API 又托管前端 dist。
 # 见 ADR-17 / §8.1。
+#
+# 可选 sidecar: financial-shim (东方财富财报适配层)。
+# 仅当用户配置了 eastmoney 自定义财务源时才需要; 未配置该数据源时可忽略。
+# 见 docs/examples/custom-financial-source/README.md。
 services:
   app:
     build:
@@ -30,3 +34,25 @@ services:
       # Windows PowerShell/CMD 下 HOME 常未设置, 可通过 .env 里 CODEX_HOME_HOST 覆盖。
       - ${CODEX_HOME_HOST:-${HOME}/.codex}:/root/.codex:ro
     restart: unless-stopped
+
+  # 东方财富 datacenter 财报适配层 (可选 sidecar)。
+  # 复用 app 镜像 (已含 app.plugins.eastmoney_shim 模块), 通过 network_mode: service:app
+  # 共享 app 的网络命名空间, 故 app 容器内 http://127.0.0.1:3021 可直达, YAML 无需改 url。
+  # depends_on 确保 app 先起 (shim 依赖其网络栈)。重启随 compose 自启, 不再需要手动 docker exec。
+  financial-shim:
+    image: tickflow-stock-panel-app
+    container_name: TickFlow_FinancialShim
+    network_mode: service:app
+    depends_on:
+      - app
+    command:
+      - uv
+      - run
+      - uvicorn
+      - app.plugins.eastmoney_shim:app
+      - --host
+      - 127.0.0.1
+      - --port
+      - "3021"
+    restart: unless-stopped
+

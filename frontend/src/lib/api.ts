@@ -1716,10 +1716,11 @@ export const api = {
       `/api/financials/shares${symbol ? `?symbol=${encodeURIComponent(symbol)}` : ''}`,
     ),
 
-  /** 触发财务数据同步(后台异步执行,接口立即返回 started 状态) */
-  financialSync: (table: string) =>
+  /** 触发财务数据同步(后台异步执行,接口立即返回 started 状态)
+   *  scope: 'all'(全市场, 默认) | 'watchlist'(仅自选股, 增量 upsert) */
+  financialSync: (table: string, scope: 'all' | 'watchlist' = 'all') =>
     request<{ status: string; synced: { started: boolean; reason?: string } }>(
-      `/api/financials/sync/${table}`, { method: 'POST' },
+      `/api/financials/sync/${table}?scope=${scope}`, { method: 'POST' },
     ),
 
   /** AI 分析报告 CRUD */

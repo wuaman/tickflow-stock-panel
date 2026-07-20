@@ -307,6 +307,14 @@ def _augment_custom_sources(capset: CapabilitySet) -> None:
             if custom_sources.provider_has_dataset(provider, "minute"):
                 capset.grant(Cap.KLINE_MINUTE_BATCH)
                 logger.info("custom minute source '%s' detected: granted KLINE_MINUTE_BATCH", provider)
+        # 自定义财务源: 配了 financial dataset 的 custom 源时补授 FINANCIAL,
+        # 使前端 (依赖 caps.capabilities.financial) 与后端 capset.has(FINANCIAL) 都放行。
+        fin_provider = preferences.get_financial_provider()
+        if fin_provider != "tickflow":
+            from app.data_providers import custom as custom_sources
+            if custom_sources.provider_has_dataset(fin_provider, "financial"):
+                capset.grant(Cap.FINANCIAL)
+                logger.info("custom financial source '%s' detected: granted FINANCIAL", fin_provider)
     except Exception as e:  # noqa: BLE001
         logger.debug("custom source augment skipped: %s", e)
 

@@ -59,18 +59,21 @@ async def lifespan(app: FastAPI):
     # instruments/index/ETF 仍同步 (毫秒级)。应用立即 ready, 指标算完后自动替换。
     repo.refresh_cache(background=True)
 
-    # 能力探测
-    capset = detect_capabilities()
-    app.state.capabilities = capset
-    logger.info("ready; %d capabilities active", len(capset.all()))
-
     # 自定义数据源配置(可选): 失败只记录错误, 不影响 TickFlow 基准路径。
+    # 必须在能力探测前加载 —— detect_capabilities() 内的 _augment_custom_sources
+    # 会检查 custom 源是否配置了 minute/financial dataset 并补授对应能力,
+    # 若 load_all() 晚于探测, 自定义财务源就无法解锁前端 financial 门控。
     try:
         from app.data_providers import custom as custom_sources
         custom_sources.load_all()
         logger.info("custom data sources loaded: %d", len(custom_sources.list_sources()))
     except Exception as e:  # noqa: BLE001
         logger.warning("custom data sources init failed: %s", e)
+
+    # 能力探测
+    capset = detect_capabilities()
+    app.state.capabilities = capset
+    logger.info("ready; %d capabilities active", len(capset.all()))
 
     # 全局行情服务
     qs = QuoteService()

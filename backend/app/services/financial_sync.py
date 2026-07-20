@@ -42,6 +42,61 @@ def _get_symbols(data_dir: Path) -> list[str]:
         return []
 
 
+def _get_watchlist_symbols() -> list[str]:
+    """从自选股表获取标的列表 (仅 symbol)。
+
+    用于「只同步自选股财报」——非全市场拉取, 规避上游 (东方财富等) 限流/封 IP。
+    """
+    try:
+        from app.services import watchlist
+        rows = watchlist.list_symbols()
+        return [r["symbol"] for r in rows if r.get("symbol")]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取自选股失败: %s", e)
+        return []
+
+
+def _resolve_symbols(data_dir: Path, scope: str | None) -> tuple[list[str], str]:
+    """按 scope 解析要同步的标的列表, 返回 (symbols, 实际生效的 scope)。
+
+    scope:
+      None / "all"      → 全市场 instruments
+      "watchlist"       → 仅自选股; 自选股为空时返回空列表 (不回退全量, 避免误触发全市场拉取)
+    """
+    scope = (scope or "all").lower()
+    if scope == "watchlist":
+        syms = _get_watchlist_symbols()
+        if not syms:
+            logger.warning("scope=watchlist 但自选股为空, 跳过同步 (不回退全量)")
+            return [], "watchlist"
+        return syms, "watchlist"
+    return _get_symbols(data_dir), "all"
+
+
+def _merge_scope(parquet_path: Path, df: pl.DataFrame, replace_symbols: list[str] | None) -> pl.DataFrame:
+    """合并本次新拉数据与磁盘已有数据, 实现按 symbol 范围 upsert。
+
+    replace_symbols=None (全量模式): 直接返回 df (调用方全量覆盖)。
+    replace_symbols 非空 (自选股增量模式): 保留磁盘上「不在 replace_symbols 内」的旧行,
+        删除 replace_symbols 内的旧行, 再 concat 本次新行。避免自选股同步冲掉其他股票数据。
+    """
+    if not replace_symbols or df.is_empty():
+        return df
+    if not parquet_path.exists():
+        return df
+    try:
+        old = pl.read_parquet(parquet_path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取旧 %s 失败, 退化为全量覆盖: %s", parquet_path.name, e)
+        return df
+    if old.is_empty() or "symbol" not in old.columns:
+        return df
+    keep = old.filter(~pl.col("symbol").is_in(replace_symbols))
+    if keep.is_empty():
+        return df
+    return pl.concat([keep, df], how="diagonal_relaxed")
+
+
 def _financial_is_custom() -> bool:
     """当前财务数据源是否走 custom (用于绕过 TickFlow Expert 套餐门槛)。"""
     from app.services import preferences
@@ -125,14 +180,15 @@ def _fetch_table(
     return df
 
 
-def _write_table(table: str, df: pl.DataFrame, data_dir: Path) -> int:
+def _write_table(table: str, df: pl.DataFrame, data_dir: Path, replace_symbols: list[str] | None = None) -> int:
     if df.is_empty() or "symbol" not in df.columns:
         return 0
 
-    # 写入 Parquet (全量覆盖)
     out_dir = data_dir / "financials" / table
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "part.parquet"
+    # replace_symbols 非空时按 symbol 增量 upsert (保留其他股票已有数据)
+    df = _merge_scope(out_file, df, replace_symbols)
     df.write_parquet(out_file)
 
     logger.info("sync_%s done: %d records written", table, len(df))
@@ -145,12 +201,17 @@ def _sync_table(
     data_dir: Path,
     capset: CapabilitySet,
     latest_only: bool = True,
+    scope: str = "all",
 ) -> int:
-    """同步单张财务表。返回写入的行数。"""
+    """同步单张财务表。返回写入的行数。
+
+    scope="watchlist" 时按 symbol 增量 upsert (不冲掉其他股票数据); "all" 全量覆盖。
+    """
     return _write_table(
         table,
         _fetch_table(table, symbols, capset, latest_only=latest_only),
         data_dir,
+        replace_symbols=symbols if scope == "watchlist" else None,
     )
 
 
@@ -193,49 +254,54 @@ def _sync_shares_for_symbols(
     return _write_table("shares", merged, data_dir)
 
 
-def sync_metrics(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_metrics(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
     """同步核心财务指标 (metrics)。"""
-    symbols = _get_symbols(data_dir)
-    return _sync_table("metrics", symbols, data_dir, capset, latest_only=True)
+    symbols, scope = _resolve_symbols(data_dir, scope)
+    return _sync_table("metrics", symbols, data_dir, capset, latest_only=True, scope=scope)
 
 
-def sync_income(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_income(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
     """同步利润表。"""
-    symbols = _get_symbols(data_dir)
-    return _sync_table("income", symbols, data_dir, capset, latest_only=True)
+    symbols, scope = _resolve_symbols(data_dir, scope)
+    return _sync_table("income", symbols, data_dir, capset, latest_only=True, scope=scope)
 
 
-def sync_balance_sheet(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_balance_sheet(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
     """同步资产负债表。"""
-    symbols = _get_symbols(data_dir)
-    return _sync_table("balance_sheet", symbols, data_dir, capset, latest_only=True)
+    symbols, scope = _resolve_symbols(data_dir, scope)
+    return _sync_table("balance_sheet", symbols, data_dir, capset, latest_only=True, scope=scope)
 
 
-def sync_cash_flow(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_cash_flow(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
     """同步现金流量表。"""
-    symbols = _get_symbols(data_dir)
-    return _sync_table("cash_flow", symbols, data_dir, capset, latest_only=True)
+    symbols, scope = _resolve_symbols(data_dir, scope)
+    return _sync_table("cash_flow", symbols, data_dir, capset, latest_only=True, scope=scope)
 
 
-def sync_shares(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_shares(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> int:
     """同步历史股本表。"""
-    symbols = _get_symbols(data_dir)
+    symbols, scope = _resolve_symbols(data_dir, scope)
+    if not symbols:
+        return 0
     return _sync_shares_for_symbols(symbols, data_dir, capset)
 
 
-def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
+def sync_all(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> dict[str, int]:
     """同步所有财务表。返回 {table: rows}。"""
     if not capset.has(Cap.FINANCIAL) and not _financial_is_custom():
         logger.info("sync_all financials skipped: no FINANCIAL capability")
         return {}
 
-    symbols = _get_symbols(data_dir)
+    symbols, scope = _resolve_symbols(data_dir, scope)
+    if not symbols:
+        logger.info("sync_all skipped: no symbols (scope=%s)", scope)
+        return {}
     results: dict[str, int] = {}
     for table in FINANCIAL_TABLES:
         results[table] = (
             _sync_shares_for_symbols(symbols, data_dir, capset)
             if table == "shares"
-            else _sync_table(table, symbols, data_dir, capset, latest_only=True)
+            else _sync_table(table, symbols, data_dir, capset, latest_only=True, scope=scope)
         )
 
     # 同步完成后注册 DuckDB 视图
@@ -405,10 +471,11 @@ class FinancialScheduler:
         except asyncio.CancelledError:
             pass
 
-    def _run_body(self, table: str | None) -> dict[str, int]:
+    def _run_body(self, table: str | None, scope: str = "all") -> dict[str, int]:
         """同步逻辑本体(不加锁,假设调用方已持有 _is_syncing)。
 
         table=None 同步全部财务表;否则只同步指定表。
+        scope="all" 同步全市场;scope="watchlist" 仅同步自选股 (增量 upsert, 不冲掉其他股票)。
         每张表完成立即更新 last_sync,让前端轮询 /status 能看到进度递增。
         """
         if table:
@@ -421,28 +488,33 @@ class FinancialScheduler:
             }.get(table)
             if not fn:
                 return {}
-            rows = fn(self._data_dir, self._capset)
+            rows = fn(self._data_dir, self._capset, scope=scope)
             self._record_sync(table)
             return {table: rows}
         # 全部同步
-        symbols = _get_symbols(self._data_dir)
+        symbols, scope = _resolve_symbols(self._data_dir, scope)
+        if not symbols:
+            logger.info("financial sync skipped: no symbols (scope=%s)", scope)
+            return {}
         result: dict[str, int] = {}
         for t in FINANCIAL_TABLES:
             result[t] = (
                 _sync_shares_for_symbols(symbols, self._data_dir, self._capset)
                 if t == "shares"
-                else _sync_table(t, symbols, self._data_dir, self._capset, latest_only=True)
+                else _sync_table(t, symbols, self._data_dir, self._capset, latest_only=True, scope=scope)
             )
             self._record_sync(t)
         _refresh_financials_views(self._data_dir)
         return result
 
-    def run_now(self, table: str | None = None) -> dict[str, int]:
+    def run_now(self, table: str | None = None, scope: str = "all") -> dict[str, int]:
         """同步执行一次同步(阻塞调用线程)。
 
         ⚠ 全量同步需数分钟,务必在后台线程调用,不要直接在 HTTP 请求线程里阻塞,
         否则请求会长时间 pending 直至被浏览器/代理超时掐断(表现为"点击无反应")。
         HTTP 接口应调用 trigger() 立即返回,再让前端轮询 /status.syncing 看进度。
+
+        scope="watchlist" 时只同步自选股, 秒级完成, 不触碰全市场拉取。
 
         用 _is_syncing 标志防并发:若已有同步在进行,本次直接跳过,
         避免重复请求拖慢服务端 / 触发上游限流。
@@ -455,18 +527,20 @@ class FinancialScheduler:
                 return {"_skipped": 1}
             self._is_syncing = True
         try:
-            return self._run_body(table)
+            return self._run_body(table, scope=scope)
         finally:
             with self._lock:
                 self._is_syncing = False
 
-    def trigger(self, table: str | None = None) -> dict[str, int]:
+    def trigger(self, table: str | None = None, scope: str = "all") -> dict[str, int]:
         """触发一次同步(非阻塞,立即返回)。
 
         在后台线程执行同步体,HTTP 请求无需等待。
         返回 {"started": True/False}:
           - False = 能力不足或已有同步在进行(被防并发跳过)
           - True  = 已在后台开始,前端应轮询 /status.syncing 观察进度
+
+        scope="watchlist" 时只同步自选股, 秒级完成, 不触碰全市场拉取。
 
         ⚠ _is_syncing 在此处置 True(持锁),确保 trigger 返回时前端轮询
         /status 已能看到 syncing=True,无竞态窗口;同时防止快速重复点击
@@ -483,7 +557,7 @@ class FinancialScheduler:
 
         def _bg() -> None:
             try:
-                self._run_body(table)
+                self._run_body(table, scope=scope)
             except Exception as e:  # noqa: BLE001
                 logger.exception("background financial sync failed: %s", e)
             finally:
@@ -492,7 +566,7 @@ class FinancialScheduler:
 
         t = threading.Thread(target=_bg, name="financial-sync", daemon=True)
         t.start()
-        logger.info("financial sync triggered in background: table=%s", table or "all")
+        logger.info("financial sync triggered in background: table=%s scope=%s", table or "all", scope)
         return {"started": True}
 
     @property
