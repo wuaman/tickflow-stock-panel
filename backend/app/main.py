@@ -137,6 +137,9 @@ async def _application_lifespan(app: FastAPI):
     repo.refresh_cache(background=True)
 
     # 自定义数据源配置(可选): 失败只记录错误, 不影响 TickFlow 基准路径。
+    # 必须在能力探测前加载 —— detect_capabilities() 内的 _augment_custom_sources
+    # 会检查 custom 源是否配置了 minute/financial dataset 并补授对应能力,
+    # 若 load_all() 晚于探测, 自定义财务源就无法解锁前端 financial 门控。
     try:
         from app.data_providers import custom as custom_sources
         custom_sources.load_all()
