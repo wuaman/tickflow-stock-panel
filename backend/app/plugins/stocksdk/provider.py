@@ -203,7 +203,29 @@ class StockSDKProvider:
         except bridge.StockSDKBridgeError as e:
             logger.warning("stock-sdk realtime 拉取失败: %s", e)
             return []
-        return result.get("rows") or []
+        rows = result.get("rows") or []
+        # stock-sdk 的 changePercent 是百分数 (12.72 = 12.72%), 而项目 enriched
+        # 全链路约定小数 (0.1272, 见 pipeline.py / quote_service._build_quote_extra)。
+        # TickFlow API 路径走 ext.change_pct(小数) + 兜底重算; stock-sdk 路径把
+        # 顶层 change_pct 直传 _build_quote_extra, 此处必须归一化到小数, 否则
+        # 前端 fmtPct 再 ×100 会显示成 1272%。同时补 change_amount 供下游使用。
+        for r in rows:
+            cp = r.get("change_pct")
+            lp = r.get("last_price")
+            pc = r.get("prev_close")
+            if cp is not None:
+                try:
+                    # stock-sdk changePercent 恒为百分数 (12.72 = 12.72%), 无条件 ÷100
+                    # 归一化到项目约定的小数制 (0.1272)
+                    r["change_pct"] = float(cp) / 100.0
+                except (TypeError, ValueError):
+                    pass
+            if r.get("change_amount") is None and lp is not None and pc is not None:
+                try:
+                    r["change_amount"] = float(lp) - float(pc)
+                except (TypeError, ValueError):
+                    pass
+        return rows
 
     # ---- instruments (标的维表) ----
     def get_instruments(self, asset_type: str = "stock") -> list[dict]:
