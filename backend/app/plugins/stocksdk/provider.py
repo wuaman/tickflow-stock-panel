@@ -292,6 +292,23 @@ class StockSDKProvider:
                         item["change_amount"] = float(last_price) - float(prev_close)
                     except (TypeError, ValueError):
                         pass
+            # [二开] stock-sdk 的 volume 单位不统一: 主板返回"手"(600900/000001),
+            # 科创板/小盘股返回"股"(688248/688549)。pipeline 的换手率公式
+            # volume*10000/float_shares 假设"手", 对"股"单位多×100 (688248 显示
+            # 167%)。用 amount(万元) 反推准确的"手"数统一口径:
+            #   成交额(元) = amount × 10000; volume_股 = 成交额/close; volume_手 = /100
+            #   => volume_手 = amount(万元) × 100 / close
+            # ⚠ 必须在下面把 amount 换算成"元"之前取原值, 否则会再大 ×10000。
+            amount_wan = item.get("amount")
+            last_price = item.get("last_price")
+            if amount_wan is not None and last_price is not None and float(last_price or 0) > 0:
+                try:
+                    item["volume"] = float(amount_wan) * 100.0 / float(last_price)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+            # stock-sdk 全量实时行情的 amount 单位为万元;内部日K统一使用元。
+            if amount_wan is not None:
+                item["amount"] = float(amount_wan) * 10_000
             normalized.append(item)
         return normalized
 
