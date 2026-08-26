@@ -48,7 +48,9 @@ def apply_historical_float_shares(
     def as_date_expr(column: str) -> pl.Expr:
         dtype = shares.schema[column]
         if dtype == pl.Utf8:
-            return pl.col(column).str.to_date(strict=False)
+            # 东方财富等源日期含 " HH:MM:SS" 时间戳, str.to_date 无法自动识别格式。
+            # 先截取前 10 位 (YYYY-MM-DD) 再解析, 与 backtest/fundamentals.py 一致。
+            return pl.col(column).str.slice(0, 10).str.to_date(strict=False)
         return pl.col(column).cast(pl.Date, strict=False)
 
     available_date = as_date_expr("period_end")
