@@ -44,6 +44,7 @@ REPORT = {
     "income": "RPT_DMSK_FN_INCOME",
     "balance_sheet": "RPT_DMSK_FN_BALANCE",
     "cash_flow": "RPT_DMSK_FN_CASHFLOW",
+    "shares": "RPT_F10_EH_EQUITY",
 }
 
 SLEEP = float(os.getenv("EM_SLEEP", "0.3"))
