@@ -9,8 +9,8 @@
 单位口径 (CONTRIBUTING §3.1, 不可凭字段名推断):
   - 扶摇 price_change_ratio_pct 为百分数数值 (1.74 = +1.74%), 本项目 realtime
     change_pct 契约为小数制 (0.0174 = 1.74%) → 此处显式 / 100。
-  - realtime volume 股→手 (/100)、amount 元→万元 (/10000), 与 daily 同口径。
-  - daily: volume 股→手 (/100)、amount 元→万元 (/10000), 见 _map_historical_items。
+  - realtime volume 股→手 (/100)、amount 元→万元 (/10000), 与 stocksdk realtime 同口径。
+  - daily: volume 股→手 (/100)、amount 保持「元」不换算, 与 stocksdk 日K及前端 fmtBigNum 口径一致。
 """
 from __future__ import annotations
 
@@ -139,7 +139,7 @@ def _map_historical_items(symbol: str, items: list[dict]) -> pl.DataFrame:
     单位口径 (与 kline_daily 契约一致):
       - date_ms: 上海时区零点毫秒 → Date
       - volume: 股 → 手 (/100)
-      - amount: 元 → 万元 (/10000)
+      - amount: 保持「元」不换算 (stocksdk 日K与前端 fmtBigNum 均按元)
     """
     if not items:
         return pl.DataFrame()
@@ -157,7 +157,7 @@ def _map_historical_items(symbol: str, items: list[dict]) -> pl.DataFrame:
             "low": _to_float(it.get("low_price")),
             "close": _to_float(it.get("close_price")),
             "vol": (_to_float(it.get("volume")) or 0.0) / 100.0,
-            "amt": (_to_float(it.get("turnover")) or 0.0) / 10000.0,
+            "amt": _to_float(it.get("turnover")) or 0.0,
         })
     if not rows:
         return pl.DataFrame()
