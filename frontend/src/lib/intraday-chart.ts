@@ -3,8 +3,9 @@ import type { MinuteKlineRow } from '@/lib/api'
 export function formatMinuteTime(datetime: string): string {
   const match = datetime.match(/(\d{2}):(\d{2})/)
   if (!match) return datetime.slice(11, 16)
-  const hour = (parseInt(match[1]) + 8) % 24
-  return `${String(hour).padStart(2, '0')}:${match[2]}`
+  // 后端 provider 已把分钟时间戳转为北京时间 (见 stocksdk._minute_df), 这里直接取 HH:MM,
+  // 不再 +8 (否则 09:30 会变 17:30, 与 FULL_DAY_TIMES 对不上, 分时图数据被丢弃)。
+  return `${match[1]}:${match[2]}`
 }
 
 export function computeIntradayAverage(data: MinuteKlineRow[]): number[] {
