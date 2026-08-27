@@ -3,13 +3,14 @@
 方法签名对齐 custom.GenericHTTPProvider(service 分流点按这套签名调用),
 注入 custom loader 注册表后, 各 service 无需改动即可路由到本 provider。
 
-当前实现数据集: realtime (A 股全市场快照, 分页)。
-未声明 daily / minute / financial → provider_has_dataset 为 False, 自动回退 tickflow。
+当前实现数据集: realtime (A 股全市场快照, 分页) + daily (历史日K, 前复权) + adj_factor (空)。
+未声明 minute / financial → provider_has_dataset 为 False, 自动回退 tickflow。
 
 单位口径 (CONTRIBUTING §3.1, 不可凭字段名推断):
   - 扶摇 price_change_ratio_pct 为百分数数值 (1.74 = +1.74%), 本项目 realtime
     change_pct 契约为小数制 (0.0174 = 1.74%) → 此处显式 / 100。
-  - volume 单位股、turnover 单位元, 与内部契约一致, 直接透传。
+  - realtime volume 单位股、turnover 单位元, 与内部契约一致, 直接透传。
+  - daily: volume 股→手 (/100)、amount 元→万元 (/10000), 见 _map_historical_items。
 """
 from __future__ import annotations
 
@@ -17,6 +18,9 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+
+import polars as pl
 
 from app.plugins.fuyao import client as fuyao_client
 from app.plugins.fuyao.client import FuyaoClient, FuyaoError
@@ -24,7 +28,9 @@ from app.plugins.fuyao.client import FuyaoClient, FuyaoError
 logger = logging.getLogger(__name__)
 
 # 只声明真实提供的数据集; 其余数据集 provider_has_dataset 返回 False → 回退 tickflow
-_DATASETS = ("realtime",)
+# adj_factor: 日K直接取前复权(adjust=forward), 复权因子返回空, 避免 stocksdk 累积因子
+# 被 _apply_adj_factor 再 cum_prod 导致二次复权。见 get_adj_factors 说明。
+_DATASETS = ("realtime", "daily", "adj_factor")
 
 API_KEY_ENV = "FUYAO_API_KEY"
 SECRETS_FIELD = "fuyao_api_key"  # UI 配置的 Key 存 secrets.json, 优先级高于 .env
@@ -127,6 +133,38 @@ def _map_snapshot_row(row: dict, fetched_ms: int) -> dict | None:
     }
 
 
+def _map_historical_items(symbol: str, items: list[dict]) -> pl.DataFrame:
+    """扶摇历史日K item[] → 内部日K DataFrame (经 normalize_daily 收口)。
+
+    单位口径 (与 kline_daily 契约一致):
+      - date_ms: 上海时区零点毫秒 → Date
+      - volume: 股 → 手 (/100)
+      - amount: 元 → 万元 (/10000)
+    """
+    if not items:
+        return pl.DataFrame()
+    shanghai = timezone(timedelta(hours=8))
+    rows: list[dict] = []
+    for it in items:
+        try:
+            d = datetime.fromtimestamp(int(it["date_ms"]) / 1000, tz=shanghai).date()
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        rows.append({
+            "date": d,
+            "open": _to_float(it.get("open_price")),
+            "high": _to_float(it.get("high_price")),
+            "low": _to_float(it.get("low_price")),
+            "close": _to_float(it.get("close_price")),
+            "vol": (_to_float(it.get("volume")) or 0.0) / 100.0,
+            "amt": (_to_float(it.get("turnover")) or 0.0) / 10000.0,
+        })
+    if not rows:
+        return pl.DataFrame()
+    from app.data_providers.normalizer import normalize_daily
+    return normalize_daily(pl.DataFrame(rows), default_symbol=symbol, source="fuyao")
+
+
 class FuyaoProvider:
     """扶摇数据源。realtime = A 股全市场快照(quote_service 全市场模式轮询调用)。"""
 
@@ -175,8 +213,73 @@ class FuyaoProvider:
         logger.info("扶摇实时行情拉取完成: %d 条(丢弃 %d 行)", len(records), dropped)
         return records
 
+    # ---- daily ----
+    def get_daily(
+        self,
+        symbols: list[str],
+        start_time: datetime | None,
+        end_time: datetime | None,
+        asset_type: str = "stock",  # noqa: ARG002
+        on_chunk_done=None,
+    ) -> pl.DataFrame:
+        """A 股历史日K (前复权 adjust=forward)。接口单只一次请求, 逐只拉取拼接。
+
+        签名对齐 stocksdk provider.get_daily (service 分流点按此调用)。
+        单只失败软跳过(记 warning), 不阻断整批; 缺口可后续 repair 补拉。
+        """
+        if not symbols:
+            return pl.DataFrame()
+        end_ms = int(end_time.timestamp() * 1000) if end_time else int(time.time() * 1000)
+        start_ms = int(start_time.timestamp() * 1000) if start_time else end_ms - 365 * 86400 * 1000
+
+        frames: list[pl.DataFrame] = []
+        total = len(symbols)
+        for i, sym in enumerate(symbols):
+            try:
+                # 每次迭代重新取 client: load_all() 重建注册表会 close 掉 provider 的
+                # 客户端, 持有旧引用会撞 "client has been closed"。这里兜底重建。
+                items = self._get_client().get_historical(sym, start_ms, end_ms, adjust="forward")
+            except (FuyaoError, RuntimeError) as e:
+                logger.warning("扶摇日K拉取失败(%s): %s", sym, e)
+                items = []
+            df = _map_historical_items(sym, items)
+            if not df.is_empty():
+                frames.append(df)
+            if on_chunk_done:
+                on_chunk_done(i + 1, total)
+        return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+    # ---- adj_factor ----
+    def get_adj_factors(
+        self,
+        symbols: list[str],
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        asset_type: str = "stock",  # noqa: ARG002
+        on_chunk_done=None,
+    ) -> pl.DataFrame:
+        """返回空复权因子: 日K已直接取前复权 (adjust=forward), 不再叠加本地复权。
+
+        stocksdk 的东方财富复权因子是累积值, 而 _apply_adj_factor 会对其 cum_prod,
+        累积值被再累乘 → 天文数字 → 涨跌停计算溢出。故本 provider 声明 adj_factor
+        数据集但返回空, 让 compute_enriched 直接采用已前复权的 OHLC, 绕过本地复权。
+        """
+        return pl.DataFrame()
+
     # ---- 测试(设置页试拉) ----
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
+        if dataset == "daily":
+            sym = (symbols or ["000001.SZ"])[0]
+            try:
+                end_ms = int(time.time() * 1000)
+                items = self._get_client().get_historical(
+                    sym, end_ms - 30 * 86400 * 1000, end_ms, adjust="forward",
+                )
+                df = _map_historical_items(sym, items)
+                return {"provider": self.name, "dataset": "daily", "rows": len(df),
+                        "columns": df.columns, "preview": df.head(5).to_dicts()}
+            except FuyaoError as e:
+                return {"provider": self.name, "dataset": "daily", "rows": 0, "error": str(e)}
         if dataset != "realtime":
             return {"provider": self.name, "dataset": dataset, "rows": 0,
                     "error": f"扶摇插件未接入 {dataset} 数据集(自动回退 TickFlow)"}

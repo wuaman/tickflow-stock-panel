@@ -82,6 +82,22 @@ class FuyaoClient:
             total = 0
         return rows, total
 
+    def get_historical(self, thscode: str, start_ms: int, end_ms: int, adjust: str = "forward") -> list[dict]:
+        """单只标的 A 股历史日 K 序列。返回 item[] (每根 bar 一个 dict)。
+
+        每次请求仅一个 thscode (接口不接受逗号)。interval 仅支持 1d。
+        adjust: none / forward(前复权) / backward(后复权)。
+        """
+        data = self._get("/api/a-share/prices/historical", {
+            "thscode": thscode,
+            "interval": "1d",
+            "start": start_ms,
+            "end": end_ms,
+            "adjust": adjust,
+        })
+        rows = data.get("item")
+        return rows if isinstance(rows, list) else []
+
     def snapshot_all(self) -> tuple[list[dict], int]:
         """分页拉取全市场快照。返回 (rows, 服务端时间戳ms)。
 
