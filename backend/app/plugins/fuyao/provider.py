@@ -9,7 +9,7 @@
 单位口径 (CONTRIBUTING §3.1, 不可凭字段名推断):
   - 扶摇 price_change_ratio_pct 为百分数数值 (1.74 = +1.74%), 本项目 realtime
     change_pct 契约为小数制 (0.0174 = 1.74%) → 此处显式 / 100。
-  - realtime volume 单位股、turnover 单位元, 与内部契约一致, 直接透传。
+  - realtime volume 股→手 (/100)、amount 元→万元 (/10000), 与 daily 同口径。
   - daily: volume 股→手 (/100)、amount 元→万元 (/10000), 见 _map_historical_items。
 """
 from __future__ import annotations
@@ -122,8 +122,8 @@ def _map_snapshot_row(row: dict, fetched_ms: int) -> dict | None:
         "open": _to_float(row.get("open_price")),
         "high": _to_float(_first(row, "high_price", "highest_price")),
         "low": _to_float(_first(row, "low_price", "lowest_price")),
-        "volume": _to_float(row.get("volume")),
-        "amount": _to_float(row.get("turnover")),
+        "volume": (_to_float(row.get("volume")) or 0.0) / 100.0,      # 股 → 手
+        "amount": (_to_float(row.get("turnover")) or 0.0) / 10000.0,  # 元 → 万元
         "change_pct": change_pct,
         "change_amount": change_amount,
         "amplitude": None,      # 快照未提供, 不启发式计算
