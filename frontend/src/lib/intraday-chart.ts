@@ -1,10 +1,9 @@
 import type { MinuteKlineRow } from '@/lib/api'
 
+/** 从 datetime 串取 HH:MM。契约: 分钟K datetime 已在后端入口统一为北京墙钟, 前端不做时区换算。 */
 export function formatMinuteTime(datetime: string): string {
   const match = datetime.match(/(\d{2}):(\d{2})/)
   if (!match) return datetime.slice(11, 16)
-  // 后端 provider 已把分钟时间戳转为北京时间 (见 stocksdk._minute_df), 这里直接取 HH:MM,
-  // 不再 +8 (否则 09:30 会变 17:30, 与 FULL_DAY_TIMES 对不上, 分时图数据被丢弃)。
   return `${match[1]}:${match[2]}`
 }
 
