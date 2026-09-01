@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import watchlist
+from app.tickflow.capabilities import Cap
 from app.services.watchlist_ocr import import_watchlist_image
 from app.services.watchlist_ocr.provider import get_ocr_provider
 
@@ -271,7 +272,65 @@ _WATCHLIST_COLS = [
     "signal_boll_breakout_upper", "signal_ma20_breakout",
     "signal_ma_dead_5_20", "signal_macd_dead", "signal_n_day_low",
     "signal_boll_breakdown_lower", "signal_ma20_breakdown",
+    # 财务指标 (最新一期, 由 financials/metrics 按 symbol LEFT JOIN; 无 FINANCIAL 能力时不 JOIN, 列被剔除)
+    "eps", "bps", "roe",
+    "gross_margin", "net_margin",
+    "revenue_yoy", "net_income_yoy", "debt_ratio",
 ]
+
+# 财务列: 自选页展示字段名 → financials/metrics 表源字段名。
+# metrics 表没有 pe_ttm / pb (需现价÷EPS/BPS 现算或估值快照), 故暂不接入, 前端渲染为 "—"。
+_FINANCIAL_COL_MAP = {
+    "eps": "eps_basic",
+    "bps": "bps",
+    "roe": "roe",
+    "gross_margin": "gross_margin",
+    "net_margin": "net_margin",
+    "revenue_yoy": "revenue_yoy",
+    "net_income_yoy": "net_income_yoy",
+    "debt_ratio": "debt_to_asset_ratio",
+}
+
+# 财务表以「百分点」存比率 (12.3 表示 12.3%), 而 enriched 列一律用小数 (0.123 表示 12.3%)。
+# 前端这些列走 fmtPct(×100), 故此处 ÷100 转成小数, 与动量/年化波动等 enriched 指标口径一致。
+# eps/bps 是每股金额、非比率, 不在此列。
+_FINANCIAL_PCT_COLS = {"roe", "gross_margin", "net_margin", "revenue_yoy", "net_income_yoy", "debt_ratio"}
+
+
+def _has_financial(request: Request) -> bool:
+    """是否有财务数据访问权限 (TickFlow FINANCIAL 套餐 或 custom 财务源)。"""
+    capset = request.app.state.capabilities
+    if capset.has(Cap.FINANCIAL):
+        return True
+    from app.services.financial_sync import _financial_is_custom
+    return _financial_is_custom()
+
+
+def _latest_financial_metrics(data_dir) -> pl.DataFrame | None:
+    """读取 financials/metrics, 取每只股票最新报告期, 重命名为自选页财务列名。
+
+    与前端财务详情页口径一致: 按 period_end 降序取最新一期。无数据或缺关键列返回 None。
+    """
+    from app.services.financial_sync import get_financial_df
+
+    df = get_financial_df(data_dir, "metrics")
+    if df.is_empty() or not {"symbol", "period_end"} <= set(df.columns):
+        return None
+    src = [c for c in _FINANCIAL_COL_MAP.values() if c in df.columns]
+    if not src:
+        return None
+    latest = (
+        df.select(["symbol", "period_end", *src])
+        .sort("period_end", descending=True, nulls_last=True)
+        .unique(subset=["symbol"], keep="first")
+    )
+    rename = {v: k for k, v in _FINANCIAL_COL_MAP.items() if v in src}
+    out = latest.select(["symbol", *src]).rename(rename)
+    # 比率字段 ÷100 (百分点 → 小数); eps/bps 不变
+    pct_cols = [c for c in _FINANCIAL_PCT_COLS if c in out.columns]
+    if pct_cols:
+        out = out.with_columns([(pl.col(c) / 100.0).alias(c) for c in pct_cols])
+    return out
 
 
 @router.get("/enriched")
@@ -357,6 +416,13 @@ def watchlist_enriched(
     df = df.with_columns(
         pl.col("symbol").replace_strict(asset_map, default="stock", return_dtype=pl.Utf8).alias("asset_type")
     )
+
+    # 财务列: 有 FINANCIAL 能力(custom 源也算)时按最新一期 metrics LEFT JOIN。
+    # 无能力时不 JOIN → 财务列不在 df.columns, 随后的 keep 选择自然剔除, 前端渲染为 "—"。
+    if _has_financial(request):
+        fin = _latest_financial_metrics(request.app.state.repo.store.data_dir)
+        if fin is not None and not fin.is_empty():
+            df = df.join(fin, on="symbol", how="left")
 
     # 选择内置需要的列
     keep = [c for c in _WATCHLIST_COLS + ["name", "float_shares", "asset_type"] if c in df.columns]
