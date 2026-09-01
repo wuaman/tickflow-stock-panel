@@ -412,6 +412,7 @@ class DataProvidersIn(BaseModel):
     daily_data_provider: str | None = None
     adj_factor_provider: str | None = None
     minute_data_provider: str | None = None
+    full_minute_data_provider: str | None = None
     depth5_data_provider: str | None = None
     realtime_data_provider: str | None = None
     financial_data_provider: str | None = None
@@ -425,6 +426,14 @@ class PluginKeyIn(BaseModel):
 class DataSourceJobTimeoutPrefs(BaseModel):
     data_source_job_timeout_s: int = Field(ge=60)
     data_source_long_job_timeout_s: int = Field(ge=60)
+
+
+class MinuteBatchCompressPrefs(BaseModel):
+    minute_batch_compress: bool
+
+
+class DailyBatchCompressPrefs(BaseModel):
+    daily_batch_compress: bool
 
 
 class DatasetFieldMapItem(BaseModel):
@@ -489,7 +498,6 @@ def get_preferences() -> dict:
     return {
         "realtime_quotes_enabled": preferences.get_realtime_quotes_enabled(),
         "realtime_allowed": _realtime_allowed(),
-        "indices_nav_pinned": preferences.get_indices_nav_pinned(),
         "watchlist_groups_in_nav": preferences.get_watchlist_groups_in_nav(),
         "minute_sync_enabled": preferences.get_minute_sync_enabled(),
         "minute_sync_days": preferences.get_minute_sync_days(),
@@ -499,12 +507,15 @@ def get_preferences() -> dict:
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
         "minute_data_provider": preferences.get_minute_data_provider(),
+        "full_minute_data_provider": preferences.get_full_minute_data_provider(),
         "minute_history_days": _minute_history_days(),
         "depth5_data_provider": preferences.get_depth5_data_provider(),
         "realtime_data_provider": preferences.get_realtime_data_provider(),
         "financial_data_provider": preferences.get_financial_provider(),
         "data_source_job_timeout_s": preferences.get_data_source_job_timeout_s(),
         "data_source_long_job_timeout_s": preferences.get_data_source_long_job_timeout_s(),
+        "minute_batch_compress": preferences.get_minute_batch_compress(),
+        "daily_batch_compress": preferences.get_daily_batch_compress(),
         **preferences.get_realtime_quote_scope(),
         "pipeline_pull_a_share": preferences.get_pipeline_pull_a_share(),
         "pipeline_pull_etf": preferences.get_pipeline_pull_etf(),
@@ -531,7 +542,6 @@ def get_preferences() -> dict:
         "wecom_bot_enabled": preferences.get_wecom_bot_enabled(),
         "webhook_enabled_default": preferences.get_webhook_enabled_default(),
         "webhook_default_channels": preferences.get_webhook_default_channels(),
-        "sidebar_index_symbols": preferences.get_sidebar_index_symbols(),
         "minute_intraday_refresh": preferences.get_minute_intraday_refresh(),
         "minute_intraday_refresh_interval": preferences.get_minute_intraday_refresh_interval(),
         "monitor_ext_fields": preferences.get_monitor_ext_fields(),
@@ -778,6 +788,7 @@ def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
         "minute_data_provider": preferences.get_minute_data_provider(),
+        "full_minute_data_provider": preferences.get_full_minute_data_provider(),
         "depth5_data_provider": preferences.get_depth5_data_provider(),
         "realtime_data_provider": preferences.get_realtime_data_provider(),
         "financial_data_provider": preferences.get_financial_provider(),
@@ -790,6 +801,22 @@ def update_data_source_job_timeouts(req: DataSourceJobTimeoutPrefs) -> dict:
     from app.services import preferences
     preferences.save(req.model_dump())
     return req.model_dump()
+
+
+@router.put("/preferences/minute-batch-compress")
+def update_minute_batch_compress(req: MinuteBatchCompressPrefs) -> dict:
+    """保存分时批量响应的 gzip 传输压缩开关。逐请求即时读取, 保存后立即生效。"""
+    from app.services import preferences
+    preferences.save({"minute_batch_compress": req.minute_batch_compress})
+    return {"minute_batch_compress": preferences.get_minute_batch_compress()}
+
+
+@router.put("/preferences/daily-batch-compress")
+def update_daily_batch_compress(req: DailyBatchCompressPrefs) -> dict:
+    """保存日K批量响应的 gzip 传输压缩开关 (与分时独立)。逐请求即时读取。"""
+    from app.services import preferences
+    preferences.save({"daily_batch_compress": req.daily_batch_compress})
+    return {"daily_batch_compress": preferences.get_daily_batch_compress()}
 
 
 @router.put("/preferences/mining-schedule")
@@ -901,9 +928,6 @@ class RealtimeQuotesPrefs(BaseModel):
 class RealtimeQuoteScopePrefs(BaseModel):
     realtime_pull_stock: bool | None = None
     realtime_pull_etf: bool | None = None
-    realtime_pull_index: bool | None = None
-    realtime_index_mode: str | None = None
-    realtime_index_symbols: list[str] | None = None
 
 
 @router.put("/preferences/realtime-quotes")
@@ -937,6 +961,16 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
             qs.disable()
         _sync_depth_polling(False)
         return {"realtime_quotes_enabled": False, "realtime_allowed": False}
+    if req.realtime_quotes_enabled:
+        # 首用门禁: 本地完全无数据 (日K/enriched 均空, 与看板首用弹窗同口径) 时
+        # 禁止开启 — 实时行情的展示 (enriched 底座 + 快照覆盖)、监控、连板梯队
+        # 全部依赖本地数据, 空数据下轮询只是空转耗配额, 且无 instruments 维表。
+        repo = getattr(request.app.state, "repo", None)
+        if repo is not None and repo.latest_daily_date() is None and repo.latest_enriched_date() is None:
+            raise HTTPException(
+                status_code=409,
+                detail="本地暂无行情数据，请先在「数据」页同步后再开启实时行情",
+            )
     if req.realtime_quotes_enabled and qs and qs.is_paused():
         # 管道/数据修正运行期间禁止开启实时行情 — 防止写盘竞态
         raise HTTPException(status_code=409, detail="数据同步运行中，实时行情已临时暂停，请稍后再开启")
@@ -985,19 +1019,6 @@ def update_realtime_quote_scope(req: RealtimeQuoteScopePrefs) -> dict:
     return preferences.set_realtime_quote_scope(cfg)
 
 
-class IndicesNavPinnedPrefs(BaseModel):
-    indices_nav_pinned: bool
-
-
-@router.put("/preferences/indices-nav-pinned")
-def update_indices_nav_pinned(req: IndicesNavPinnedPrefs) -> dict:
-    """保存侧栏指数报价卡片固定显示开关。
-    ON=常驻显示；OFF=跟随实时行情开关（仅实时开时显示）。"""
-    from app.services import preferences
-    preferences.save({"indices_nav_pinned": req.indices_nav_pinned})
-    return {"indices_nav_pinned": req.indices_nav_pinned}
-
-
 class WatchlistGroupsInNavPrefs(BaseModel):
     watchlist_groups_in_nav: bool
 
@@ -1014,7 +1035,6 @@ class RealtimeMonitorConfigIn(BaseModel):
     sse_refresh_pages: dict[str, bool] | None = None
     strategy_monitor_enabled: bool | None = None
     strategy_monitor_ids: list[str] | None = None
-    sidebar_index_symbols: list[str] | None = None
     screener_auto_run: bool | None = None
     minute_intraday_refresh: bool | None = None
     minute_intraday_refresh_interval: int | None = None
