@@ -169,6 +169,8 @@ function CapabilityCard({ cap, pendingKey, onSelect }: {
   // 能力中立判定: usable=False 即当前路由的源供不了 (TickFlow 档位不足或插件未就绪同待遇)
   const unmet = !cap.usable
   const chipsEmpty = cap.candidates.length === 0 && cap.pending.length === 0
+  // 财务能力由后台双源策略接管 (fuyao 主源 + 东财盘后自选股补数), 不开放手动切换
+  const locked = cap.field === 'financial_data_provider'
   return (
     <div className="rounded-lg border border-border/50 bg-elevated/20 px-3 py-2.5 flex flex-col transition-colors hover:border-border">
       <div className="flex items-center gap-1.5">
@@ -204,12 +206,14 @@ function CapabilityCard({ cap, pendingKey, onSelect }: {
           const active = cap.current === c.name
           // field=null → 不可路由能力 (仅 TickFlow 提供): 渲染为非交互标签,
           // 保持激活高亮但不可点击 (用 button+disabled 会被 opacity-50 冲淡成灰色)
-          const routable = cap.field != null
+          const routable = cap.field != null && !locked
           if (!routable) {
             return (
               <span
                 key={c.name}
-                title={`「${cap.label}」仅 ${c.display} 提供 (不可路由)`}
+                title={locked
+                  ? '财务能力由后台双源策略管理 (主源 + 东财盘后自选股补数), 不支持手动切换'
+                  : `「${cap.label}」仅 ${c.display} 提供 (不可路由)`}
                 className={tagCls(active, false, false)}
               >
                 {c.display}
@@ -230,6 +234,15 @@ function CapabilityCard({ cap, pendingKey, onSelect }: {
             </button>
           )
         })}
+        {locked && (
+          <span
+            title="财务能力由后台双源策略管理 (主源 + 东财盘后自选股补数), 不支持手动切换"
+            className="inline-flex items-center gap-1 text-[10px] text-muted/50"
+          >
+            <Lock className="h-2.5 w-2.5" />
+            后台管理
+          </span>
+        )}
         {/* 未就绪源: 声明了该能力但依赖/Key 未配好, 置灰并说明原因 */}
         {cap.pending.map(c => (
           <span
@@ -302,12 +315,15 @@ function CapabilityRoutingSection() {
     },
   })
 
+  // 恢复默认时不动财务路由 (后台双源策略管理, 误切会把财务源切回 tickflow 导致不可用)
+  const RESET_ROUTING = { ...DEFAULT_ROUTING, financial_data_provider: undefined } as Record<string, string | undefined>
+
   const resetMut = useMutation({
-    mutationFn: () => api.updateDataProviders(DEFAULT_ROUTING),
+    mutationFn: () => api.updateDataProviders(RESET_ROUTING),
     onMutate: async () => {
       await qc.cancelQueries({ queryKey: QK.capabilityMatrix })
       await qc.cancelQueries({ queryKey: QK.preferences })
-      return applyOptimistic(DEFAULT_ROUTING)
+      return applyOptimistic(RESET_ROUTING)
     },
     onSuccess: () => toast('能力路由已恢复默认', 'success'),
     onError: (e: Error, _v, ctx) => {
@@ -653,7 +669,8 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
 
   const switchProvider = useMutation({
     mutationFn: async (name: string) => {
-      // 一键套用: 该源适配了哪些数据集就接管哪些, 其余回默认
+      // 一键套用: 该源适配了哪些数据集就接管哪些, 其余回默认。
+      // 财务不参与: 由后台双源策略管理 (主源 + 东财盘后自选股补数)。
       if (name === 'tickflow') {
         return api.updateDataProviders(DEFAULT_ROUTING)
       }
@@ -662,13 +679,14 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
       )
       const pick = (dataset: string) =>
         supported.has(dataset) ? name : DEFAULT_ROUTING[`${dataset}_data_provider` as ProviderField] ?? 'tickflow'
-      return api.updateDataProviders({
+      const updates: Record<string, string> = {
         daily_data_provider: pick('daily'),
         adj_factor_provider: pick('adj_factor'),
         realtime_data_provider: pick('realtime'),
         minute_data_provider: pick('minute'),
-        financial_data_provider: pick('financial'),
-      })
+      }
+      // 套用 fuyao 等无财务冲突的源时维持现财务路由不动
+      return api.updateDataProviders(updates)
     },
     onSuccess: (_d, name) => {
       invalidateSources()
