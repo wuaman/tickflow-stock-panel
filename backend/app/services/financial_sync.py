@@ -319,10 +319,12 @@ _EM_SUPPLEMENT_HOUR = 16  # 每天本地 16:0x 触发 (A股盘后)
 
 
 def sync_em_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
-    """东财源对自选股做一次增量补数 (latest_only, 新披露期覆盖/补空列)。
+    """东财源对自选股补数: 未覆盖的拉全量历史, 已覆盖的仅刷最新期。
 
     前提: 主财务源不是东财 (否则与常规同步重复), 且东财 custom 源已配置可用。
-    请求量 = 自选股数 × 表数, 十几只时几十个请求, 远低于封 IP 阈值。
+    覆盖判定: income 表该股任一期有东财特征字段 name (SECURITY_NAME_ABBR,
+    fuyao 不产此列) → 已覆盖。新加自选股首次补数自动获得全量深历史
+    (约 86 期), 之后每天仅增量刷最新期 — 请求量 = 自选股数 × 表数。
     """
     from app.services import preferences
 
@@ -338,22 +340,45 @@ def sync_em_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
         logger.info("em_supplement skipped: watchlist 为空")
         return {}
 
+    # 东财未覆盖的自选股 → 全量历史; 已覆盖 → 仅增量
+    existing_income = get_financial_df(data_dir, "income")
+    em_covered: set[str] = set()
+    if not existing_income.is_empty() and "name" in existing_income.columns:
+        em_covered = set(
+            existing_income.filter(pl.col("name").is_not_null())["symbol"]
+            .unique().to_list()
+        )
+    deep_symbols = [s for s in symbols if s not in em_covered]
+    incr_symbols = [s for s in symbols if s in em_covered]
+    if deep_symbols:
+        logger.info(
+            "em_supplement: %d 只新自选股拉全量历史: %s", len(deep_symbols), deep_symbols
+        )
+
     logger.info("em_supplement: %d 只自选股 via %s", len(symbols), EM_SUPPLEMENT_PROVIDER)
     results: dict[str, int] = {}
     for table in FINANCIAL_TABLES:
         try:
-            latest = _fetch_table(
-                table, symbols, capset, latest_only=True,
-                provider=EM_SUPPLEMENT_PROVIDER,
-            )
-            if latest.is_empty():
+            frames: list[pl.DataFrame] = []
+            if incr_symbols:
+                frames.append(_fetch_table(
+                    table, incr_symbols, capset, latest_only=True,
+                    provider=EM_SUPPLEMENT_PROVIDER,
+                ))
+            if deep_symbols:
+                frames.append(_fetch_table(
+                    table, deep_symbols, capset, latest_only=False,
+                    provider=EM_SUPPLEMENT_PROVIDER,
+                ))
+            frames = [f for f in frames if not f.is_empty()]
+            if not frames:
                 results[table] = 0
                 continue
             existing = get_financial_df(data_dir, table)
             if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
-                merged = _merge_report_history(latest)
+                merged = _merge_report_history(*frames)
             else:
-                merged = _merge_report_history(existing, latest)
+                merged = _merge_report_history(existing, *frames)
             results[table] = _write_table(table, merged, data_dir)
         except Exception as e:  # noqa: BLE001
             logger.warning("em_supplement %s failed: %s", table, e)
