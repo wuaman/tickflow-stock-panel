@@ -86,3 +86,17 @@ def trading_minutes_elapsed_from_ts(ts_ms: int | float | None) -> float:
         return float(_TRADING_TOTAL_MINUTES)
     return trading_minutes_elapsed_from_dt(dt)
 
+
+def last_completed_trading_day(now: datetime | None = None) -> date:
+    """最后一个已收盘的交易日 — 日K批量拉取的 end 边界。
+
+    交易日 15:00 后 → 今天已收盘, 返回今天; 否则(盘中/周末)返回昨天。
+    周末/节假日不做精确日历回退(节假日误报的代价只是一次空范围拉取, 无害),
+    周末缺口由下游 fuyao dump 的 _tail_ok(≤3 天周末容忍)兜底。
+    """
+    now = now or cn_now()
+    today = now.date()
+    if today.weekday() < 5 and now.time() >= _AFTERNOON_END:
+        return today
+    return today - timedelta(days=1)
+
