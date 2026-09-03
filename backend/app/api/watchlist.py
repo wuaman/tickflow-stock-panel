@@ -23,20 +23,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
-
-def _request_financial_supplement(request: Request) -> None:
-    """自选股变动后请求尽快跑一次财务双源补数 (防抖, 由调度器 30s 内执行)。
-
-    新加的股票由此自动获得东财+fuyao 深历史, 无需等到每天 16:07 定点。
-    调度器不可用或未启用时静默跳过 (补数循环仍会按日定点跑)。
-    """
-    try:
-        fs = getattr(request.app.state, "financial_scheduler", None)
-        if fs and hasattr(fs, "request_supplement"):
-            fs.request_supplement()
-    except Exception as e:  # noqa: BLE001
-        logger.debug("request_supplement failed: %s", e)
-
 _MAX_IMPORT_IMAGE_BYTES = 12 * 1024 * 1024  # 12MB
 _IMPORT_IMAGE_TYPES = {
     "image/jpeg",
@@ -112,7 +98,6 @@ def add_one(req: AddRequest, request: Request):
         rows = watchlist.add(req.symbol, req.note, req.group_id)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    _request_financial_supplement(request)
     return {"symbols": _with_names(rows, request)}
 
 
@@ -127,8 +112,6 @@ def add_batch(req: BatchAddRequest, request: Request):
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    if added:
-        _request_financial_supplement(request)
     return {"symbols": _with_names(rows, request), "added": added}
 
 
