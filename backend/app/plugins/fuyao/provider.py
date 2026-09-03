@@ -56,7 +56,8 @@ SECRETS_FIELD = "fuyao_api_key"  # UI 配置的 Key 存 secrets.json, 优先级�
 _SH_MS = 28_800_000
 _HIST_MAX_SPAN_MS = 3650 * 86_400_000  # historical 单次窗口上限 10 年, 超出由本层分片
 _HIST_INTERVAL_S = 0.12  # 单标的请求节流(实测 200+ 连发未触发 4001 限频)
-_FINANCIAL_HISTORY_PERIODS = 8  # 财务首装全量历史: 最近 8 期季报(约 2 年)
+_FINANCIAL_HISTORY_PERIODS = 20  # 财务首装全量历史: quarterly 单次上限 20 期(约 5 年)
+_FINANCIAL_ANNUAL_PERIODS = 20  # annual 维度再拉 20 期年报(约 20 年), 与季度合并去重
 _VALUATION_BATCH = 100  # 估值/价格快照端点单次上限 100 只
 # 项目财务表名 → 扶摇报表端点名
 _STATEMENT_ENDPOINTS = {
@@ -805,7 +806,8 @@ class FuyaoProvider:
     ) -> pl.DataFrame:
         """拉取财务数据, 映射为 canonical 列(symbol/period_end/announce_date/指标)。
 
-        - 三大报表: 单股单请求, latest_only 决定最近 1 期还是 8 期季报;
+        - 三大报表: 单股单请求, latest_only 决定最近 1 期还是全量历史
+          (quarterly 20 期 + annual 20 期双维度, 约 20 年);
         - metrics: 指标接口为单股单期, 恒只拉最新一期(bps 由估值快照 pb_mrq 反推,
           eps_basic 顺带取自利润表); 历史各期建议切回 TickFlow 同步补齐 —
           报告期合并写入会让两源数据共存, 互不覆盖;
@@ -833,13 +835,38 @@ class FuyaoProvider:
         latest_only: bool,
     ) -> pl.DataFrame:
         client = self._get_client()
-        limit = 1 if latest_only else _FINANCIAL_HISTORY_PERIODS
+        # 全量历史: quarterly(上限 20 期季报) + annual(20 期年报) 双维度合并,
+        # 年末报告期两口径同值, 去重由 _merge_report_history 兜底。
+        # latest_only: 仅拉最新 1 期, 不拉 annual。
+        if not latest_only:
+            frames = []
+            for period, limit in (
+                ("quarterly", _FINANCIAL_HISTORY_PERIODS),
+                ("annual", _FINANCIAL_ANNUAL_PERIODS),
+            ):
+                df = self._fetch_statements_period(
+                    client, stmt, field_map, symbols, period, limit
+                )
+                if not df.is_empty():
+                    frames.append(df)
+            return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+        return self._fetch_statements_period(client, stmt, field_map, symbols, None, 1)
+
+    def _fetch_statements_period(
+        self,
+        client: FuyaoClient,
+        stmt: str,
+        field_map: dict[str, str],
+        symbols: list[str],
+        period: str | None,
+        limit: int,
+    ) -> pl.DataFrame:
         rows_out: list[dict] = []
         for i, sym in enumerate(symbols):
             if i:
                 time.sleep(_HIST_INTERVAL_S)
             try:
-                rows = client.financial_statements(stmt, sym, limit=limit)
+                rows = client.financial_statements(stmt, sym, limit=limit, period=period)
             except FuyaoError as e:
                 logger.warning("扶摇财务 %s %s 失败: %s", stmt, sym, e)
                 continue
