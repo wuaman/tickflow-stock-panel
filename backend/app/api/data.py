@@ -411,17 +411,23 @@ def _safe_aggregate_financials(repo) -> dict | None:
     data_dir = repo.store.data_dir
     tables_info: dict[str, dict] = {}
     total_rows = 0
+    all_dates: list[str] = []
 
     for table in ("metrics", "income", "balance_sheet", "cash_flow", "shares"):
         path = data_dir / "financials" / table / "part.parquet"
         if path.exists():
             try:
                 import polars as pl
-                df = pl.read_parquet(path, columns=["symbol"])
+                df = pl.read_parquet(path, columns=["symbol", "period_end"])
                 rows = len(df)
                 symbols = df["symbol"].n_unique() if not df.is_empty() else 0
                 tables_info[table] = {"rows": rows, "symbols": symbols}
                 total_rows += rows
+                dates = (
+                    df.get_column("period_end")
+                    .drop_nulls().unique().sort().to_list()
+                )
+                all_dates.extend(d for d in dates if isinstance(d, str))
             except Exception:
                 tables_info[table] = {"rows": 0, "symbols": 0}
         else:
@@ -433,6 +439,8 @@ def _safe_aggregate_financials(repo) -> dict | None:
     return {
         "rows": total_rows,
         "tables": tables_info,
+        "earliest_date": min(all_dates) if all_dates else None,
+        "latest_date": max(all_dates) if all_dates else None,
     }
 
 
