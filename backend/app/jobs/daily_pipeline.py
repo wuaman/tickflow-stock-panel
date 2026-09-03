@@ -22,7 +22,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
 from app.indicators.pipeline import filter_halt_days, run_pipeline
-from app.market_time import cn_today
+from app.market_time import cn_today, last_completed_trading_day
 from app.services import index_sync, instrument_sync, kline_sync
 from app.services import preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
@@ -231,6 +231,12 @@ def run_now(
     # 管道「今天」必须是北京日期: 美西主机 15:35 北京时间仍是本地昨天,
     # date.today() 会把昨日日K当成已齐, 当日官方收盘价永远拉不进来。
     today = cn_today()
+    # 日K拉取的 end 边界: 封顶到"最后一个已收盘交易日"。盘中(交易日 15:00 前)
+    # 把 end 设成今天会拿到未收盘的半日数据, 且扶摇 10d dump 要收盘后才发布、
+    # 覆盖不到今天 → 退化到单标的逐股接口(限流/超时), 部分标的拉取失败会留下
+    # 盘中快照行 → 完整性门禁反复触发修复, 形成无限循环。故统一用 daily_end。
+    # 与上面的 today 正交: today 定"今天是哪天"(时区), daily_end 定"能拉到哪天"(收盘)。
+    daily_end = last_completed_trading_day()
     today_exists = latest_daily and latest_daily >= today
     new_daily_days = 0
 
@@ -281,7 +287,7 @@ def run_now(
         written_daily = kline_sync.sync_and_persist_daily_batch(
             universe, repo, capset,
             start_date=_dt.combine(start_date, _dt.min.time()),
-            end_date=_dt.combine(today, _dt.min.time()),
+            end_date=_dt.combine(daily_end, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
         )
         gap_days = (today - start_date).days
@@ -322,7 +328,7 @@ def run_now(
         written_daily = kline_sync.sync_and_persist_daily_batch(
             universe, repo, capset,
             start_date=_dt.combine(start_date, _dt.min.time()),
-            end_date=_dt.combine(today, _dt.min.time()),
+            end_date=_dt.combine(daily_end, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
         )
         gap_days = (today - start_date).days
@@ -342,7 +348,7 @@ def run_now(
         written_daily = kline_sync.sync_and_persist_daily_batch(
             universe, repo, capset,
             start_date=_dt.combine(start_date, _dt.min.time()),
-            end_date=_dt.combine(today, _dt.min.time()),
+            end_date=_dt.combine(daily_end, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
         )
         new_daily_days = 365
