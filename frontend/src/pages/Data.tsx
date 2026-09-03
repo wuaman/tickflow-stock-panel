@@ -549,7 +549,11 @@ export function Data() {
           <StatCard
             title="财务数据"
             hint="财报 / 指标 / 历史股本"
-            stats={s?.financials ? { rows: s.financials.rows } : null}
+            stats={s?.financials ? {
+              rows: s.financials.rows,
+              earliest_date: s.financials.earliest_date,
+              latest_date: s.financials.latest_date,
+            } : null}
             loading={isLoading}
             tierKey="financials"
             capLimits={mergedCaps}

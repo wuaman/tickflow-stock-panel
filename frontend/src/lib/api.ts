@@ -3319,7 +3319,12 @@ export interface DataStatus {
   minute: TableStats | null
   adj_factor: TableStats | null
   instruments: InstrumentsStats | null
-  financials: { rows: number; tables: Record<string, { rows: number; symbols: number }> } | null
+  financials: {
+    rows: number
+    tables: Record<string, { rows: number; symbols: number }>
+    earliest_date?: string | null
+    latest_date?: string | null
+  } | null
   storage: {
     daily_files: number
     daily_size_mb: number

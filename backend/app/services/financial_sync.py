@@ -523,6 +523,23 @@ class FinancialScheduler:
         self._em_task = None
         logger.info("FinancialScheduler stopped")
 
+    def _metrics_due(self) -> bool:
+        """距上次 metrics 同步是否已满 7 天。
+
+        防止"启动后 60s 首跑"在每次重启时都重拉全市场 (约 1.1 万个请求、
+        20~40 分钟): _last_sync 从 preferences.json 恢复, 7 天内跑过就跳过。
+        """
+        last = self._last_sync.get("metrics")
+        if not last:
+            return True  # 从未同步过 → 跑
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - last_dt).total_seconds() >= 7 * 86_400
+        except ValueError:
+            return True
+
     async def _run_loop(self) -> None:
         """每周执行一次 metrics 同步; 每天盘后跑一次东财自选股补数。"""
         try:
@@ -532,16 +549,20 @@ class FinancialScheduler:
                 if not self._running:
                     break
 
-                # 每周: 只同步 metrics (在线程池跑: sync_metrics 是同步阻塞且
-                # 请求量大(fuyao 指标需逐股反查利润表), 直接 await 会卡死事件循环)
-                try:
-                    rows = await asyncio.to_thread(
-                        sync_metrics, self._data_dir, self._capset
-                    )
-                    self._record_sync("metrics")
-                    logger.info("FinancialScheduler: metrics synced, %d rows", rows)
-                except Exception as e:
-                    logger.warning("FinancialScheduler: metrics sync failed: %s", e)
+                # 每周: 只同步 metrics (7 天内跑过则跳过, 重启不再重拉全市场)
+                if not self._metrics_due():
+                    logger.info("FinancialScheduler: metrics synced within 7d, skip")
+                else:
+                    try:
+                        # 在线程池跑: sync_metrics 是同步阻塞且请求量大
+                        # (fuyao 指标需逐股反查利润表), 直接 await 会卡死事件循环
+                        rows = await asyncio.to_thread(
+                            sync_metrics, self._data_dir, self._capset
+                        )
+                        self._record_sync("metrics")
+                        logger.info("FinancialScheduler: metrics synced, %d rows", rows)
+                    except Exception as e:
+                        logger.warning("FinancialScheduler: metrics sync failed: %s", e)
 
                 # 等待下一次 (7天)
                 for _ in range(7 * 24 * 60):  # 每分钟检查一次 _running
