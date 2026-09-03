@@ -187,19 +187,22 @@ class FuyaoClient:
     }
 
     def financial_statements(
-        self, stmt: str, thscode: str, limit: int = 1
+        self, stmt: str, thscode: str, limit: int = 1, period: str | None = None
     ) -> list[dict]:
         """单标的财务报表多期序列。stmt: income | balance_sheet | cash_flow。
 
+        period: None(默认, 上游按季度口径) | quarterly | annual。
+        annual 返回年度累计口径, 单次同样上限 20 期, 可拉约 20 年年报。
         返回 data.item 原始行: 共有元数据(thscode/period/fiscal_year/fiscal_period/
         report_date_ms/period_end_ms/currency) + 各表字段。行内 null 表示该期未披露。
         """
         endpoint = self._STATEMENT_ENDPOINTS.get(stmt)
         if endpoint is None:
             raise FuyaoError(f"未知财务报表类型: {stmt}")
+        params: dict = {"thscode": thscode, "period": period or "quarterly", "limit": max(1, min(20, limit))}
         data = self._get(
             f"/api/a-share/financials/{endpoint}",
-            {"thscode": thscode, "period": "quarterly", "limit": max(1, min(20, limit))},
+            params,
         )
         rows = data.get("item")
         return rows if isinstance(rows, list) else []
