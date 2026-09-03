@@ -76,7 +76,11 @@ def _resolve_symbols(data_dir: Path, scope: str | None) -> tuple[list[str], str]
 def _financial_is_custom() -> bool:
     """当前财务数据源是否走 custom (用于绕过 TickFlow Expert 套餐门槛)。"""
     from app.services import preferences
-    provider = preferences.get_financial_provider()
+    return _provider_is_custom(preferences.get_financial_provider())
+
+
+def _provider_is_custom(provider: str) -> bool:
+    """指定数据源是否为配置了 financial 数据集的 custom 源。"""
     if provider == "tickflow":
         return False
     from app.data_providers import custom as custom_sources
@@ -88,9 +92,15 @@ def _fetch_table(
     symbols: list[str],
     capset: CapabilitySet,
     latest_only: bool = True,
+    provider: str | None = None,
 ) -> pl.DataFrame:
-    """通过当前财务数据源拉取一张标准化财务表。"""
-    is_custom = _financial_is_custom()
+    """通过财务数据源拉取一张标准化财务表。
+
+    provider: None(默认, 用当前 preferences 里的财务源) | "fuyao" | custom 源名。
+    显式指定时绕过 preferences, 供双源互补补数使用 (如 fuyao 为主源时
+    定时用东财 custom 源补 watchlist 的独有字段), 不改动用户的选择。
+    """
+    is_custom = _financial_is_custom() if provider is None else _provider_is_custom(provider)
     if not is_custom and not capset.has(Cap.FINANCIAL):
         logger.info("sync_%s skipped: no FINANCIAL capability", table)
         return pl.DataFrame()
@@ -102,9 +112,11 @@ def _fetch_table(
     if is_custom:
         from app.services import preferences
         from app.data_providers import custom as custom_sources
+        source_name = provider or preferences.get_financial_provider()
         try:
-            provider = custom_sources.get_provider(preferences.get_financial_provider())
-            df = provider.get_financials(table, symbols, latest_only=latest_only)
+            df = custom_sources.get_provider(source_name).get_financials(
+                table, symbols, latest_only=latest_only
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning("sync_%s custom provider failed: %s", table, e)
             return pl.DataFrame()
@@ -176,11 +188,12 @@ def _sync_table(
     data_dir: Path,
     capset: CapabilitySet,
     latest_only: bool = True,
+    provider: str | None = None,
 ) -> int:
     """同步单张财务表。返回写入的行数。"""
     return _write_table(
         table,
-        _fetch_table(table, symbols, capset, latest_only=latest_only),
+        _fetch_table(table, symbols, capset, latest_only=latest_only, provider=provider),
         data_dir,
     )
 
@@ -243,25 +256,28 @@ def _sync_history_table_for_symbols(
     symbols: list[str],
     data_dir: Path,
     capset: CapabilitySet,
+    provider: str | None = None,
 ) -> int:
     """历史累积同步: 保留已有各期记录, 仅拉最新期 + 为新标的补全量历史。
+
+    provider 透传给 _fetch_table (None=当前 preferences 的财务源)。
 
     与 shares 同一模式。若改为 latest_only 全量覆盖, 历史各期会在每次同步时
     被冲掉, 财务因子将永远只有单期快照, 任何回测都是未来函数。
     """
     existing = get_financial_df(data_dir, table)
     if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
-        return _sync_table(table, symbols, data_dir, capset, latest_only=False)
+        return _sync_table(table, symbols, data_dir, capset, latest_only=False, provider=provider)
 
     existing_symbols = set(existing["symbol"].drop_nulls().to_list())
     missing_symbols = [symbol for symbol in symbols if symbol not in existing_symbols]
     missing_history = (
-        _fetch_table(table, missing_symbols, capset, latest_only=False)
+        _fetch_table(table, missing_symbols, capset, latest_only=False, provider=provider)
         if missing_symbols
         else pl.DataFrame()
     )
     current_symbols = [symbol for symbol in symbols if symbol in existing_symbols]
-    latest = _fetch_table(table, current_symbols, capset, latest_only=True)
+    latest = _fetch_table(table, current_symbols, capset, latest_only=True, provider=provider)
     merged = _merge_report_history(existing, missing_history, latest)
     return _write_table(table, merged, data_dir)
 
@@ -296,8 +312,58 @@ def sync_shares(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> in
     return _sync_history_table_for_symbols("shares", symbols, data_dir, capset)
 
 
+# 东财补充源: 仅对 watchlist 拉取, 每天 1 次增量, 避免全市场拉取封 IP。
+# fuyao 缺的东财独有字段(资产负债率/存货/固定资产等)由此补齐, 主源仍是用户选的。
+EM_SUPPLEMENT_PROVIDER = "eastmoney_financial"
+_EM_SUPPLEMENT_HOUR = 16  # 每天本地 16:0x 触发 (A股盘后)
+
+
+def sync_em_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
+    """东财源对自选股做一次增量补数 (latest_only, 新披露期覆盖/补空列)。
+
+    前提: 主财务源不是东财 (否则与常规同步重复), 且东财 custom 源已配置可用。
+    请求量 = 自选股数 × 表数, 十几只时几十个请求, 远低于封 IP 阈值。
+    """
+    from app.services import preferences
+
+    main_provider = preferences.get_financial_provider()
+    if main_provider == EM_SUPPLEMENT_PROVIDER:
+        return {}  # 主源就是东财, 无需补充
+    if not _provider_is_custom(EM_SUPPLEMENT_PROVIDER):
+        logger.info("em_supplement skipped: eastmoney_financial 源未配置")
+        return {}
+
+    symbols = _get_watchlist_symbols()
+    if not symbols:
+        logger.info("em_supplement skipped: watchlist 为空")
+        return {}
+
+    logger.info("em_supplement: %d 只自选股 via %s", len(symbols), EM_SUPPLEMENT_PROVIDER)
+    results: dict[str, int] = {}
+    for table in FINANCIAL_TABLES:
+        try:
+            latest = _fetch_table(
+                table, symbols, capset, latest_only=True,
+                provider=EM_SUPPLEMENT_PROVIDER,
+            )
+            if latest.is_empty():
+                results[table] = 0
+                continue
+            existing = get_financial_df(data_dir, table)
+            if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
+                merged = _merge_report_history(latest)
+            else:
+                merged = _merge_report_history(existing, latest)
+            results[table] = _write_table(table, merged, data_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("em_supplement %s failed: %s", table, e)
+            results[table] = -1
+    _refresh_financials_views(data_dir)
+    logger.info("em_supplement done: %s", results)
+    return results
+
+
 def sync_all(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> dict[str, int]:
-    """同步所有财务表。返回 {table: rows}。scope=watchlist 仅同步自选股 (增量, 不冲掉其他股票)。"""
     if not capset.has(Cap.FINANCIAL) and not _financial_is_custom():
         logger.info("sync_all financials skipped: no FINANCIAL capability")
         return {}
@@ -361,6 +427,7 @@ class FinancialScheduler:
 
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
+        self._em_task: asyncio.Task | None = None
         self._running = False
         self._data_dir: Path | None = None
         self._capset: CapabilitySet | None = None
@@ -413,6 +480,7 @@ class FinancialScheduler:
 
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
+        self._em_task = asyncio.create_task(self._run_em_supplement_loop())
         logger.info("FinancialScheduler started (auto-schedule enabled)")
 
     def _record_sync(self, table: str) -> None:
@@ -448,13 +516,15 @@ class FinancialScheduler:
 
     def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
-            self._task = None
+        for t in (self._task, self._em_task):
+            if t:
+                t.cancel()
+        self._task = None
+        self._em_task = None
         logger.info("FinancialScheduler stopped")
 
     async def _run_loop(self) -> None:
-        """每周执行一次 metrics 同步。"""
+        """每周执行一次 metrics 同步; 每天盘后跑一次东财自选股补数。"""
         try:
             while self._running:
                 # 首次启动等 60s, 之后每 7 天执行一次
@@ -476,6 +546,43 @@ class FinancialScheduler:
                         break
                     await asyncio.sleep(60)
 
+        except asyncio.CancelledError:
+            pass
+
+    async def _run_em_supplement_loop(self) -> None:
+        """每天本地 16:0x (A股盘后) 对自选股跑一次东财源补数 (方案 B)。
+
+        独立于主 loop: 主 loop 频率低(每周), 本 loop 每天醒一次对表。
+        跑在 asyncio.to_thread 里, 不阻塞事件循环; 失败只记日志, 次日重试。
+        """
+        import time as _time
+
+        def _seconds_until_target(now_ts: float) -> float:
+            """距下一个 16:0x 的秒数 (错开整分, 避与其他盘后任务抢点)。"""
+            lt = _time.localtime(now_ts)
+            target_h, target_m = _EM_SUPPLEMENT_HOUR, 7
+            secs_today = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+            target_secs = target_h * 3600 + target_m * 60
+            return (target_secs - secs_today) % 86_400
+
+        try:
+            while self._running:
+                wait = _seconds_until_target(_time.time())
+                # 分片等待, 每分钟检查 _running, stop() 能及时退出
+                for _ in range(int(wait // 60) + 1):
+                    if not self._running:
+                        return
+                    await asyncio.sleep(60)
+                if not self._running:
+                    return
+                try:
+                    await asyncio.to_thread(
+                        sync_em_supplement, self._data_dir, self._capset
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("em_supplement loop failed: %s", e)
+                # 跑完后睡到明天 (避免同一天重复触发)
+                await asyncio.sleep(3_600)
         except asyncio.CancelledError:
             pass
 

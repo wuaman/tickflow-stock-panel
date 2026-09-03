@@ -777,9 +777,16 @@ def test_data_source(req: CustomSourceTestIn) -> dict:
 
 @router.put("/preferences/data-providers")
 def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
-    """保存数据源选择。"""
+    """保存数据源选择。
+
+    财务路由不在前端开放手动切换: 由后台双源策略管理 (主源 + 东财盘后
+    自选股补数)。此处忽略 financial_data_provider 字段, 保持现值。
+    """
     from app.services import preferences
     updates = req.model_dump(exclude_none=True)
+    # 财务源受保护: 双源补数依赖稳定的 financial_data_provider, 前端任何
+    # 批量切换/恢复默认不得改动。要改只能直接改 preferences.json。
+    updates.pop("financial_data_provider", None)
     if updates:
         preferences.save(updates)
     # 刷新能力快照: 当前 provider 变化会改变自定义源能力增广结果 (读缓存, 无网络请求)
