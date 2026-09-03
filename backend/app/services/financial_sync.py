@@ -515,10 +515,6 @@ class FinancialScheduler:
         self._last_sync: dict[str, str] = {}  # {table: iso_timestamp}
         # 手动同步(run_now)是否正在进行。前端据此显示"同步中"并防重复点击。
         self._is_syncing = False
-        # 自选变动请求的补数时间戳(防抖): 非零且已到点 → 补数循环尽快执行一次
-        self._supplement_requested_at: float = 0.0
-        # 每日定点补数是否已跑过: (year, yday) 或 None
-        self._last_daily_supplement: tuple[int, int] | None = None
 
     def start(self, data_dir: Path, capset: CapabilitySet, *, auto_schedule: bool = False) -> None:
         """初始化调度器，并按需启动周期同步后台任务。
@@ -657,81 +653,40 @@ class FinancialScheduler:
         except asyncio.CancelledError:
             pass
 
-    def request_supplement(self, delay_s: float = 20.0) -> None:
-        """请求尽快跑一次自选股双源补数 (自选股增删后由 watchlist API 调用)。
-
-        防抖: 连续添加多只时取最晚到期时间, 只跑一次。
-        补数循环每 30s 醒来检查, 实际执行 ≈ delay_s + 30s 内。
-        """
-        import time as _time
-
-        self._supplement_requested_at = max(
-            self._supplement_requested_at, _time.time() + delay_s
-        )
-        logger.info("watchlist_supplement requested (debounce %.0fs)", delay_s)
-
-    def _run_supplement_once(self) -> None:
-        """带并发保护地跑一次补数 (与手动/全量同步共用 _is_syncing, 防止并发写 parquet)。"""
-        if not self._data_dir or not self._capset:
-            return
-        with self._lock:
-            if self._is_syncing:
-                logger.info("watchlist_supplement skipped: another sync running")
-                return
-            self._is_syncing = True
-        try:
-            sync_watchlist_supplement(self._data_dir, self._capset)
-        finally:
-            with self._lock:
-                self._is_syncing = False
-
     async def _run_em_supplement_loop(self) -> None:
-        """自选股双源补数循环: 每天 16:0x (A股盘后) 一次 + 自选变动即时触发。
+        """每天本地 16:0x (A股盘后) 对自选股跑一次东财源补数 (方案 B)。
 
-        每 30s 醒一次检查: (a) 是否到每日定点, (b) 是否有防抖到期的即时请求。
-        补数本体在线程池跑(同步阻塞 + 网络请求), 不卡事件循环;
-        失败只记日志 — 定点路径次日重试, 即时路径由下次自选变动再触发。
+        独立于主 loop: 主 loop 频率低(每周), 本 loop 每天醒一次对表。
+        跑在 asyncio.to_thread 里, 不阻塞事件循环; 失败只记日志, 次日重试。
         """
         import time as _time
 
-        def _daily_due(now_ts: float) -> bool:
-            """今天 16:07 及以后, 且今天还没跑过定点补数。"""
+        def _seconds_until_target(now_ts: float) -> float:
+            """距下一个 16:0x 的秒数 (错开整分, 避与其他盘后任务抢点)。"""
             lt = _time.localtime(now_ts)
-            if lt.tm_hour != _EM_SUPPLEMENT_HOUR or lt.tm_min < 7:
-                return False
-            return self._last_daily_supplement != (lt.tm_year, lt.tm_yday)
+            target_h, target_m = _EM_SUPPLEMENT_HOUR, 7
+            secs_today = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+            target_secs = target_h * 3600 + target_m * 60
+            return (target_secs - secs_today) % 86_400
 
         try:
-            self._last_daily_supplement = None
             while self._running:
-                now = _time.time()
-                lt = _time.localtime(now)
-                today = (lt.tm_year, lt.tm_yday)
-
-                req_due = self._supplement_requested_at > 0 and now >= self._supplement_requested_at
-                daily = _daily_due(now)
-                if req_due or daily:
-                    if req_due:
-                        self._supplement_requested_at = 0.0
-                    if daily:
-                        self._last_daily_supplement = today
-                    try:
-                        await asyncio.to_thread(self._run_supplement_once)
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("watchlist_supplement loop failed: %s", e)
-                    # 跑完睡 60s 再进下一轮检查, 防止同秒重复触发
-                    await asyncio.sleep(60)
-                    continue
-
-                # 下一次醒来时间: min(30s, 即时请求到期时间)
-                nap = 30.0
-                if self._supplement_requested_at > 0:
-                    nap = min(nap, max(1.0, self._supplement_requested_at - now))
-                # 分片等待, 保证 stop() 能及时退出
-                for _ in range(int(nap // 30) + 1):
+                wait = _seconds_until_target(_time.time())
+                # 分片等待, 每分钟检查 _running, stop() 能及时退出
+                for _ in range(int(wait // 60) + 1):
                     if not self._running:
                         return
-                    await asyncio.sleep(min(30.0, nap))
+                    await asyncio.sleep(60)
+                if not self._running:
+                    return
+                try:
+                    await asyncio.to_thread(
+                        sync_watchlist_supplement, self._data_dir, self._capset
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("em_supplement loop failed: %s", e)
+                # 跑完后睡到明天 (避免同一天重复触发)
+                await asyncio.sleep(3_600)
         except asyncio.CancelledError:
             pass
 
@@ -739,9 +694,22 @@ class FinancialScheduler:
         """同步逻辑本体(不加锁,假设调用方已持有 _is_syncing)。
 
         table=None 同步全部财务表;否则只同步指定表。
-        scope="watchlist" 仅同步自选股 (增量, 不冲掉其他股票)。
+        scope="watchlist" 仅同步自选股 (增量, 不冲掉其他股票), 且完成后立即
+        追加双源补数 (东财全量/增量 + fuyao 深历史) — 用户点「全部同步(自选股)」
+        即时获得新自选股的深历史, 不必等每日 16:07 的自动补数。
         每张表完成立即更新 last_sync,让前端轮询 /status 能看到进度递增。
         """
+        result = self._run_tables(table, scope)
+        if (scope or "all").lower() == "watchlist":
+            try:
+                supp = sync_watchlist_supplement(self._data_dir, self._capset)
+                logger.info("watchlist manual sync → dual-source supplement: %s", supp)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("watchlist dual-source supplement failed: %s", e)
+        return result
+
+    def _run_tables(self, table: str | None, scope: str) -> dict[str, int]:
+        """常规同步: fuyao(主源) 按表拉取, 新股票全量历史 / 老股票最新 1 期。"""
         if table:
             fn = {
                 "metrics": sync_metrics,
