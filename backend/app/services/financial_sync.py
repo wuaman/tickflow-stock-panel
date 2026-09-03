@@ -532,9 +532,12 @@ class FinancialScheduler:
                 if not self._running:
                     break
 
-                # 每周: 只同步 metrics
+                # 每周: 只同步 metrics (在线程池跑: sync_metrics 是同步阻塞且
+                # 请求量大(fuyao 指标需逐股反查利润表), 直接 await 会卡死事件循环)
                 try:
-                    rows = sync_metrics(self._data_dir, self._capset)
+                    rows = await asyncio.to_thread(
+                        sync_metrics, self._data_dir, self._capset
+                    )
                     self._record_sync("metrics")
                     logger.info("FinancialScheduler: metrics synced, %d rows", rows)
                 except Exception as e:
