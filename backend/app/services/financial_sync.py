@@ -185,6 +185,28 @@ def _sync_table(
     )
 
 
+def _normalize_period_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """归一化 period_end / announce_date 为 YYYY-MM-DD 纯日期字符串。
+
+    不同数据源的日期口径不一: 东方财富 datacenter 返回 "2026-06-30 00:00:00"
+    (带时间), 扶摇返回 "2026-06-30" (纯日期)。若不归一, 按 (symbol, period_end)
+    字符串精确相等去重时同一报告期会被当成两期, 两行并存且字段各缺一半。
+    统一截断到前 10 字符 (ISO 日期), 无法解析的行保持原值不丢数据。
+    """
+    if df.is_empty():
+        return df
+    exprs = []
+    for col in ("period_end", "announce_date"):
+        if col in df.columns and df.schema[col] == pl.Utf8:
+            exprs.append(
+                pl.when(pl.col(col).str.len_chars() >= 10)
+                .then(pl.col(col).str.slice(0, 10))
+                .otherwise(pl.col(col))
+                .alias(col)
+            )
+    return df.with_columns(exprs) if exprs else df
+
+
 def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
     """按 (symbol, period_end) 合并各报告期, 同期多行逐列取最新非空值。
 
@@ -194,7 +216,7 @@ def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
     无 announce_date 的帧按输入顺序, 后写优先(与旧行为 keep="last" 一致)。
     """
     valid = [
-        frame
+        _normalize_period_columns(frame)
         for frame in frames
         if not frame.is_empty() and {"symbol", "period_end"} <= set(frame.columns)
     ]
