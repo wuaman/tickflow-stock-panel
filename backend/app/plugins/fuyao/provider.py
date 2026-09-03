@@ -885,39 +885,57 @@ class FuyaoProvider:
                 rows_out.append(row)
         return pl.DataFrame(rows_out) if rows_out else pl.DataFrame()
 
-    def _financial_metrics(self, symbols: list[str]) -> pl.DataFrame:
+    def _financial_metrics(self, symbols: list[str], latest_only: bool = True) -> pl.DataFrame:
         client = self._get_client()
-        # 指标接口按 report(yyyy-N) 单期查询 → 先用利润表 limit=1 反查每股最新披露期
-        latest: dict[str, dict] = {}
-        for i, sym in enumerate(symbols):
-            if i:
-                time.sleep(_HIST_INTERVAL_S)
-            try:
-                rows = client.financial_statements("income", sym, limit=1)
-            except FuyaoError as e:
-                logger.warning("扶摇财务 income %s 失败: %s", sym, e)
-                continue
-            if rows:
-                latest[sym] = rows[0]
-        if not latest:
-            return pl.DataFrame()
-        bps_by_sym = self._derive_bps(sorted(latest))
+        # 指标接口按 report(yyyy-N) 单期查询 → 先用利润表反查披露期。
+        # latest_only: 最新 1 期; 全量: quarterly 20 + annual 20 期合并去重后
+        # 逐期查指标 — ROA/资产负债率/周转率/净利率等字段仅指标接口提供
+        # (东财 metrics 报表没有), 历史期不查就永远缺。
+        limit = 1 if latest_only else _FINANCIAL_HISTORY_PERIODS
+        probe_dims: list[str | None] = ["quarterly"] if latest_only else ["quarterly", "annual"]
+        bps_by_sym = self._derive_bps(symbols)
         rows_out: list[dict] = []
-        for sym, r in latest.items():
-            quarter = _report_quarter(r.get("fiscal_period"))
-            report = f"{r.get('fiscal_year')}-{quarter}" if quarter else None
-            row: dict = {
-                "symbol": sym,
-                "period_end": _iso_of_ms(r.get("period_end_ms")),
-                "announce_date": _iso_of_ms(r.get("report_date_ms")),
-                "eps_basic": _to_float(r.get("basic_eps")),
-                "bps": bps_by_sym.get(sym),
-            }
-            if report:
+        req_count = 0
+        for sym in symbols:
+            reports: dict[str, dict] = {}
+            latest_key: str | None = None
+            for dim in probe_dims:
+                if req_count:
+                    time.sleep(_HIST_INTERVAL_S)
+                req_count += 1
                 try:
-                    abilities = client.financial_indicators(sym, report)
+                    rows = client.financial_statements("income", sym, limit=limit, period=dim)
                 except FuyaoError as e:
-                    logger.warning("扶摇指标 %s %s 失败: %s", sym, report, e)
+                    logger.warning("扶摇财务 income %s(%s) 失败: %s", sym, dim, e)
+                    continue
+                for r in rows:
+                    quarter = _report_quarter(r.get("fiscal_period"))
+                    if quarter is None:
+                        continue
+                    key = f"{r.get('fiscal_year')}-{quarter}"
+                    if latest_key is None or key > latest_key:
+                        latest_key = key
+                    reports.setdefault(key, r)
+            for key, r in reports.items():
+                row: dict = {
+                    "symbol": sym,
+                    "period_end": _iso_of_ms(r.get("period_end_ms")),
+                    "announce_date": _iso_of_ms(r.get("report_date_ms")),
+                    "eps_basic": _to_float(r.get("basic_eps")),
+                }
+                if key == latest_key:
+                    row["bps"] = bps_by_sym.get(sym)
+                if req_count:
+                    time.sleep(_HIST_INTERVAL_S)
+                req_count += 1
+                try:
+                    abilities = client.financial_indicators(sym, key)
+                except FuyaoError as e:
+                    # 历史期未披露/无数据属正常 (如 2010 年前), 降级为 info 不刷屏
+                    if latest_only:
+                        logger.warning("扶摇指标 %s %s 失败: %s", sym, key, e)
+                    else:
+                        logger.info("扶摇指标 %s %s 无数据(跳过): %s", sym, key, e)
                     abilities = []
                 for ability in abilities:
                     for ind in ability.get("indicators") or []:
@@ -927,8 +945,16 @@ class FuyaoProvider:
                         value = _to_float(ind.get("value"))
                         if value is not None:
                             row[self._METRICS_FIELD_MAP.get(index_id, index_id)] = value
-            rows_out.append(row)
+                rows_out.append(row)
         return pl.DataFrame(rows_out) if rows_out else pl.DataFrame()
+
+    def financial_metrics_history(self, symbols: list[str]) -> pl.DataFrame:
+        """全量历史核心指标: quarterly 20 + annual 20 期逐期查指标接口。
+
+        请求量大 (每股约 45+ 次), 仅用于自选股补数, 禁止全市场调用 —
+        全市场 metrics 同步仍走 get_financials() 只刷最新一期。
+        """
+        return self._financial_metrics(symbols, latest_only=False)
 
     def trading_days(self) -> set:
         """近一年交易日集合 (供交易日探针)。失败抛 FuyaoError, 由探针兜为未知。"""

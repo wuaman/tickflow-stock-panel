@@ -321,6 +321,22 @@ _EM_SUPPLEMENT_HOUR = 16  # 每天本地 16:0x 触发 (A股盘后)
 _FUYAO_DEEP_PREFS_KEY = "financials_fuyao_deep_symbols"
 
 
+def _fuyao_metrics_history(symbols: list[str]) -> pl.DataFrame:
+    """fuyao 全量历史核心指标 (每股约 45+ 请求, 仅自选股补数用)。
+
+    ROA/资产负债率/净利率/周转率等字段只有 fuyao 指标接口提供 (东财 metrics
+    报表没有这些列), 且指标接口按单期查询 → 历史期需逐期补查。
+    """
+    try:
+        from app.data_providers import custom as custom_sources
+        provider = custom_sources.get_provider("fuyao")
+        history = getattr(provider, "financial_metrics_history", None)
+        return history(symbols) if history else pl.DataFrame()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("fuyao metrics history failed: %s", e)
+        return pl.DataFrame()
+
+
 def _fuyao_deep_done() -> set[str]:
     """已做过 fuyao 全量历史补数的股票集合 (preferences 持久化, 重启不丢)。"""
     from app.services import preferences
@@ -421,7 +437,12 @@ def sync_watchlist_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str
         fy_fetched: set[str] = set()
         for table in ("metrics", "income", "balance_sheet", "cash_flow"):
             try:
-                fy_full = _fetch_table(table, fy_pending, capset, latest_only=False)
+                if table == "metrics":
+                    # 指标历史只能 fuyao 提供 (ROA/资产负债率等), 逐期查请求量大,
+                    # 仅此处调用; 全市场 metrics 同步恒只刷最新一期
+                    fy_full = _fuyao_metrics_history(fy_pending)
+                else:
+                    fy_full = _fetch_table(table, fy_pending, capset, latest_only=False)
                 if fy_full.is_empty():
                     continue
                 fy_fetched.update(fy_full["symbol"].unique().to_list())
