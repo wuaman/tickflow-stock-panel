@@ -318,13 +318,33 @@ EM_SUPPLEMENT_PROVIDER = "eastmoney_financial"
 _EM_SUPPLEMENT_HOUR = 16  # 每天本地 16:0x 触发 (A股盘后)
 
 
-def sync_em_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
-    """东财源对自选股补数: 未覆盖的拉全量历史, 已覆盖的仅刷最新期。
+_FUYAO_DEEP_PREFS_KEY = "financials_fuyao_deep_symbols"
 
+
+def _fuyao_deep_done() -> set[str]:
+    """已做过 fuyao 全量历史补数的股票集合 (preferences 持久化, 重启不丢)。"""
+    from app.services import preferences
+    return set(preferences.load().get(_FUYAO_DEEP_PREFS_KEY) or [])
+
+
+def _mark_fuyao_deep_done(symbols: list[str]) -> None:
+    from app.services import preferences
+    done = _fuyao_deep_done() | set(symbols)
+    preferences.save({_FUYAO_DEEP_PREFS_KEY: sorted(done)})
+
+
+def sync_watchlist_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
+    """自选股双源补数 (每天盘后由调度器跑一次):
+
+    1. 东财源: 未覆盖的自选股拉全量历史(约 50 期), 已覆盖的仅刷最新期 —
+       补东财独有字段(资产负债率/存货/固定资产等)。
+    2. fuyao 源: 首次进入自选的股票补一次全量历史(quarterly 20 + annual 20,
+       约 40 期) — 补 fuyao 独有字段(研发费用/资本开支/流动资产合计等)。
+       成功过的股票记入 preferences, 不重复拉 (fuyao 深窗口一次即拉满,
+       新期由常规同步增量覆盖)。
+
+    同一报告期两源都有数据时, _merge_report_history 逐列取最新非空 → 双源字段并存。
     前提: 主财务源不是东财 (否则与常规同步重复), 且东财 custom 源已配置可用。
-    覆盖判定: income 表该股任一期有东财特征字段 name (SECURITY_NAME_ABBR,
-    fuyao 不产此列) → 已覆盖。新加自选股首次补数自动获得全量深历史
-    (约 86 期), 之后每天仅增量刷最新期 — 请求量 = 自选股数 × 表数。
     """
     from app.services import preferences
 
@@ -332,15 +352,19 @@ def sync_em_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
     if main_provider == EM_SUPPLEMENT_PROVIDER:
         return {}  # 主源就是东财, 无需补充
     if not _provider_is_custom(EM_SUPPLEMENT_PROVIDER):
-        logger.info("em_supplement skipped: eastmoney_financial 源未配置")
+        logger.info("watchlist_supplement skipped: eastmoney_financial 源未配置")
         return {}
 
     symbols = _get_watchlist_symbols()
     if not symbols:
-        logger.info("em_supplement skipped: watchlist 为空")
+        logger.info("watchlist_supplement skipped: watchlist 为空")
         return {}
 
-    # 东财未覆盖的自选股 → 全量历史; 已覆盖 → 仅增量
+    results: dict[str, int] = {}
+
+    # ---- 1. 东财补数 ----
+    # 覆盖判定: income 表该股任一期有东财特征字段 name (SECURITY_NAME_ABBR,
+    # fuyao 不产此列) → 已覆盖。
     existing_income = get_financial_df(data_dir, "income")
     em_covered: set[str] = set()
     if not existing_income.is_empty() and "name" in existing_income.columns:
@@ -352,11 +376,14 @@ def sync_em_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
     incr_symbols = [s for s in symbols if s in em_covered]
     if deep_symbols:
         logger.info(
-            "em_supplement: %d 只新自选股拉全量历史: %s", len(deep_symbols), deep_symbols
+            "watchlist_supplement: %d 只新自选股拉东财全量历史: %s",
+            len(deep_symbols), deep_symbols,
         )
 
-    logger.info("em_supplement: %d 只自选股 via %s", len(symbols), EM_SUPPLEMENT_PROVIDER)
-    results: dict[str, int] = {}
+    logger.info(
+        "watchlist_supplement: %d 只自选股, 东财全量 %d / 增量 %d",
+        len(symbols), len(deep_symbols), len(incr_symbols),
+    )
     for table in FINANCIAL_TABLES:
         try:
             frames: list[pl.DataFrame] = []
@@ -381,10 +408,38 @@ def sync_em_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
                 merged = _merge_report_history(existing, *frames)
             results[table] = _write_table(table, merged, data_dir)
         except Exception as e:  # noqa: BLE001
-            logger.warning("em_supplement %s failed: %s", table, e)
+            logger.warning("watchlist_supplement em %s failed: %s", table, e)
             results[table] = -1
+
+    # ---- 2. fuyao 深历史补数 (每只股票一次性) ----
+    fy_pending = [s for s in symbols if s not in _fuyao_deep_done()]
+    if fy_pending:
+        logger.info(
+            "watchlist_supplement: %d 只自选股补 fuyao 全量历史: %s",
+            len(fy_pending), fy_pending,
+        )
+        fy_fetched: set[str] = set()
+        for table in ("metrics", "income", "balance_sheet", "cash_flow"):
+            try:
+                fy_full = _fetch_table(table, fy_pending, capset, latest_only=False)
+                if fy_full.is_empty():
+                    continue
+                fy_fetched.update(fy_full["symbol"].unique().to_list())
+                existing = get_financial_df(data_dir, table)
+                if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
+                    merged = _merge_report_history(fy_full)
+                else:
+                    merged = _merge_report_history(existing, fy_full)
+                _write_table(table, merged, data_dir)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("watchlist_supplement fuyao_deep %s failed: %s", table, e)
+        # 只记成功拉到的股票; 因 429 等失败的下轮重试
+        if fy_fetched:
+            _mark_fuyao_deep_done(sorted(fy_fetched))
+            logger.info("watchlist_supplement: fuyao 深历史完成 %d 只", len(fy_fetched))
+
     _refresh_financials_views(data_dir)
-    logger.info("em_supplement done: %s", results)
+    logger.info("watchlist_supplement done: %s", results)
     return results
 
 
@@ -626,7 +681,7 @@ class FinancialScheduler:
                     return
                 try:
                     await asyncio.to_thread(
-                        sync_em_supplement, self._data_dir, self._capset
+                        sync_watchlist_supplement, self._data_dir, self._capset
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("em_supplement loop failed: %s", e)
