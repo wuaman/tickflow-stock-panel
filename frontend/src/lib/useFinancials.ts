@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 
@@ -11,13 +12,27 @@ export const FINANCIAL_QK = {
 }
 
 export function useFinancialStatus() {
-  return useQuery({
+  const qc = useQueryClient()
+  // 上一次轮询到的 syncing 状态: 检测 true→false 跳变 (后台同步刚完成)。
+  // 注意 trigger 的 onSuccess 在同步"开始"时触发, 那时数据还没写入;
+  // 各表查询 staleTime=5min, 必须等同步真正结束后再失效, 否则刚同步的
+  // 股票在缓存里还是"暂无数据"。
+  const prevSyncing = useRef<boolean | null>(null)
+  const query = useQuery({
     queryKey: FINANCIAL_QK.status,
     queryFn: () => api.financialStatus(),
     staleTime: 60_000,
     // 同步进行中时每 3s 轮询,及时反映表数变化与同步完成;空闲时不轮询。
     refetchInterval: (query) => (query.state.data?.syncing ? 3_000 : false),
   })
+  const syncing = query.data?.syncing ?? false
+  useEffect(() => {
+    if (prevSyncing.current === true && !syncing) {
+      qc.invalidateQueries({ queryKey: ['financials'] })
+    }
+    prevSyncing.current = syncing
+  }, [syncing, qc])
+  return query
 }
 
 export function financialMetricsQueryOptions(symbol?: string) {
@@ -79,8 +94,9 @@ export function useFinancialSync() {
       qc.invalidateQueries({ queryKey: FINANCIAL_QK.status })
     },
     onSuccess: () => {
+      // 仅刷 status 让 syncing 立刻反映; 各表缓存的失效由 useFinancialStatus
+      // 检测 syncing true→false 跳变时统一处理 (trigger 返回时数据还没写完)。
       qc.invalidateQueries({ queryKey: FINANCIAL_QK.status })
-      qc.invalidateQueries({ queryKey: ['financials'] })
     },
   })
 }
