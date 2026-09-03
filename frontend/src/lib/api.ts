@@ -1950,6 +1950,11 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ url }),
     }),
+  sendTestWebhook: (channel: 'feishu' | 'wecom') =>
+    request<{ ok: boolean; detail: string }>('/api/settings/preferences/webhook-test', {
+      method: 'POST',
+      body: JSON.stringify({ channel }),
+    }),
   updateWecomBot: (botId: string, secret: string, enabled: boolean = true) =>
     request<{
       wecom_bot_id: string
@@ -2187,10 +2192,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ symbol, note, group_id: groupId ?? null }),
     }),
-  watchlistBatchAdd: (symbols: string[], note = '', groupId?: string | null) =>
+  watchlistBatchAdd: (symbols: string[], note = '', groupId?: string | null, groupIds?: string[]) =>
     request<{ symbols: WatchlistEntry[]; added: number }>('/api/watchlist/batch', {
       method: 'POST',
-      body: JSON.stringify({ symbols, note, group_id: groupId ?? null }),
+      body: JSON.stringify({
+        symbols,
+        note,
+        group_id: groupId ?? null,
+        group_ids: groupIds?.length ? groupIds : null,
+      }),
     }),
   watchlistGroups: () =>
     request<{ groups: WatchlistGroup[] }>('/api/watchlist/groups'),
@@ -2246,6 +2256,22 @@ export const api = {
       quiet,
     })
   },
+  watchlistImportCsv: (file: File, signal?: AbortSignal, quiet = false) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return request<WatchlistImportResult>('/api/watchlist/import-csv', {
+      method: 'POST',
+      body: fd,
+      signal,
+      quiet,
+    })
+  },
+  watchlistImportCodes: (text: string, signal?: AbortSignal) =>
+    request<WatchlistImportResult>('/api/watchlist/import-codes', {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+      signal,
+    }),
   watchlistRemove: (symbol: string) =>
     request<{ symbols: WatchlistEntry[] }>(
       `/api/watchlist/${encodeURIComponent(symbol)}`,
@@ -2525,6 +2551,9 @@ export const api = {
     '/api/pipeline/run', { method: 'POST' },
   ),
   pipelineJob: (id: string) => request<PipelineJob>(`/api/pipeline/jobs/${id}`),
+  /** 手动停止一个 running/pending 的同步任务 (协作式: 当前分块完成后线程自行退出) */
+  pipelineJobCancel: (id: string) =>
+    request<{ cancelled: string }>(`/api/pipeline/jobs/${id}/cancel`, { method: 'POST' }),
   pipelineJobs: (limit = 20) =>
     request<{ active_id: string | null; jobs: PipelineJobSummary[] }>(
       `/api/pipeline/jobs?limit=${limit}`,

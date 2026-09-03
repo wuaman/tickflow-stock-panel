@@ -276,40 +276,43 @@ class StockSDKProvider:
             logger.warning("stock-sdk realtime 拉取失败: %s", e)
             return []
         rows = result.get("rows") or []
-        # stock-sdk 的 changePercent 是百分数 (12.72 = 12.72%), 而项目 enriched
-        # 全链路约定小数 (0.1272, 见 pipeline.py / quote_service._build_quote_extra)。
-        # TickFlow API 路径走 ext.change_pct(小数) + 兜底重算; stock-sdk 路径把
-        # 顶层 change_pct 直传 _build_quote_extra, 此处必须归一化到小数, 否则
-        # 前端 fmtPct 再 ×100 会显示成 1272%。同时补 change_amount 供下游使用。
-        for r in rows:
-            cp = r.get("change_pct")
-            lp = r.get("last_price")
-            pc = r.get("prev_close")
-            if cp is not None:
+        normalized: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            # stock-sdk 的 changePercent 是百分数值(-1.15 = -1.15%);
+            # provider 入口契约统一使用小数制(-0.0115 = -1.15%)。
+            if item.get("change_pct") is not None:
                 try:
-                    # stock-sdk changePercent 恒为百分数 (12.72 = 12.72%), 无条件 ÷100
-                    # 归一化到项目约定的小数制 (0.1272)
-                    r["change_pct"] = float(cp) / 100.0
+                    item["change_pct"] = float(item["change_pct"]) / 100
                 except (TypeError, ValueError):
                     pass
-            if r.get("change_amount") is None and lp is not None and pc is not None:
+            # stock-sdk 全量实时行情的 amount 单位为万元;内部日K统一使用元。
+            if item.get("amount") is not None:
                 try:
-                    r["change_amount"] = float(lp) - float(pc)
+                    item["amount"] = float(item["amount"]) * 10_000
+                except (TypeError, ValueError):
+                    pass
+            # change_amount 兜底补算, 供 _build_quote_extra / quote_service 使用
+            lp = item.get("last_price")
+            pc = item.get("prev_close")
+            if item.get("change_amount") is None and lp is not None and pc is not None:
+                try:
+                    item["change_amount"] = float(lp) - float(pc)
                 except (TypeError, ValueError):
                     pass
             # stock-sdk 的 volume 单位不统一: 主板返回"手"(600900/000001),
             # 科创板/小盘股返回"股"(688248/688549)。pipeline 的换手率公式
             # volume*10000/float_shares 假设"手", 对"股"单位多×100 (688248 显示
-            # 167%)。用 amount(万元) ×100 / close 反推准确的"手"数统一口径:
-            #   成交额(元) = amount × 10000; volume_股 = 成交额/close; volume_手 = /100
-            #   => volume_手 = amount × 100 / close
-            amt = r.get("amount")
+            # 167%)。用 amount(已归一化为元) / close 反推准确的"手"数统一口径:
+            #   volume_股 = 成交额(元)/close; volume_手 = /100
+            amt = item.get("amount")
             if amt is not None and lp is not None and float(lp or 0) > 0:
                 try:
-                    r["volume"] = float(amt) * 100.0 / float(lp)
+                    item["volume"] = float(amt) / float(lp) / 100.0
                 except (TypeError, ValueError, ZeroDivisionError):
                     pass
-        return rows
+            normalized.append(item)
+        return normalized
 
     # ---- instruments (标的维表) ----
     def get_instruments(self, asset_type: str = "stock") -> list[dict]:
