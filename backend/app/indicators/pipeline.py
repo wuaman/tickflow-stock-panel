@@ -604,6 +604,26 @@ INDICATOR_COLUMNS: frozenset[str] = frozenset(
     col for col in _ALL_INDICATOR_COLS if not col.startswith("_")
 )
 
+# ── 权威涨跌停价防御性校验 ─────────────────────────────────────────
+# instruments 维表盘前同步(09:10)可能拉到上一交易日的涨跌停价 (provider 未滚动到
+# 新交易日), 而 as_of 已盖当日 → 盘中/盘后计算误信权威价, 涨停漏判+假涨停混入。
+# 规则: 权威价与理论价 (昨收×涨跌幅) 偏差超容差 → 视为维表滞后, 回退理论价。
+# 容差 = max(2分, 0.5%): 覆盖低价股的分档取整误差, 远小于滞后一天的偏差 (~10%)。
+_AUTH_LIMIT_TOL_ABS = 0.02
+_AUTH_LIMIT_TOL_REL = 0.005
+
+
+def _auth_limit_consistent(auth: pl.Expr, theoretical: pl.Expr) -> pl.Expr:
+    """权威涨跌停价与理论价是否一致。
+
+    理论价为 null (无前收盘, 如新股) 时返回 True —— 此时权威价是唯一可用值,
+    不干预 (信号计算自身的 prev_close 有效性门槛会兜住这种行)。
+    """
+    tol = pl.max_horizontal(
+        pl.lit(_AUTH_LIMIT_TOL_ABS), theoretical * pl.lit(_AUTH_LIMIT_TOL_REL)
+    )
+    return ((auth - theoretical).abs() <= tol).fill_null(True)
+
 
 def get_signal_dependencies() -> dict[str, frozenset[str]]:
     """返回内置与 JSON 自定义信号的唯一依赖映射。"""
@@ -807,6 +827,7 @@ def compute_limit_signals(
             authoritative_date
             & pl.col("limit_up").is_not_null()
             & (pl.col("limit_up") < _SENTINEL)
+            & _auth_limit_consistent(pl.col("limit_up"), pl.col("_theoretical_limit_up"))
         ).then(pl.col("limit_up")).otherwise(pl.col("_theoretical_limit_up"))
     else:
         effective_limit_up = pl.col("_theoretical_limit_up")
@@ -815,6 +836,7 @@ def compute_limit_signals(
             authoritative_date
             & pl.col("limit_down").is_not_null()
             & (pl.col("limit_down") < _SENTINEL)
+            & _auth_limit_consistent(pl.col("limit_down"), pl.col("_theoretical_limit_down"))
         ).then(pl.col("limit_down")).otherwise(pl.col("_theoretical_limit_down"))
     else:
         effective_limit_down = pl.col("_theoretical_limit_down")
@@ -824,6 +846,42 @@ def compute_limit_signals(
     if need_down:
         effective_exprs.append(effective_limit_down.alias("_effective_limit_down"))
     df = df.with_columns(effective_exprs)
+
+    # 权威价偏差超容差回退理论价的行数统计 (维表滞后观测)
+    _stale_flags: list[pl.Expr] = []
+    if "limit_up" in df.columns:
+        _stale_flags.append(
+            (
+                authoritative_date
+                & pl.col("limit_up").is_not_null()
+                & (pl.col("limit_up") < _SENTINEL)
+                & ~_auth_limit_consistent(pl.col("limit_up"), pl.col("_theoretical_limit_up"))
+            ).fill_null(False).alias("_auth_stale_up")
+        )
+    if "limit_down" in df.columns:
+        _stale_flags.append(
+            (
+                authoritative_date
+                & pl.col("limit_down").is_not_null()
+                & (pl.col("limit_down") < _SENTINEL)
+                & ~_auth_limit_consistent(pl.col("limit_down"), pl.col("_theoretical_limit_down"))
+            ).fill_null(False).alias("_auth_stale_down")
+        )
+    if _stale_flags:
+        df = df.with_columns(_stale_flags)
+        n_stale = int(
+            df.filter(
+                pl.any_horizontal(
+                    *[c for c in ("_auth_stale_up", "_auth_stale_down") if c in df.columns]
+                )
+            ).height
+        )
+        if n_stale:
+            logger.warning(
+                "权威涨跌停价与理论价偏差超容差, %d 行回退理论价 (instruments 维表疑似滞后, 检查盘前同步时机)",
+                n_stale,
+            )
+        df = df.drop([c for c in ("_auth_stale_up", "_auth_stale_down") if c in df.columns])
 
     # ── signal_limit_up ──
     if need_up:
@@ -2192,14 +2250,20 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
 
     # 涨跌停 (用 raw_close / raw_high 和前一日原始收盘价)
     # 优先用 API 原始前收盘价, 回退到 close_right, 最后回退到 raw_close
+    # prev_ref_reliable: 理论价基准是否来自真实前收盘 (API prev_close / 昨收)。
+    # 最后的 raw_close 兜底 (无任何前收盘信息) 下理论价 = 今收×涨幅, 恒不触发
+    # 涨停 —— 此时权威价是唯一正确来源, 不参与偏差校验。
     if "_prev_close_raw" in df.columns:
+        prev_ref_reliable = pl.lit(True)
         if "close_right" in df.columns:
             prev_raw = pl.when(pl.col("_prev_close_raw").is_not_null()).then(pl.col("_prev_close_raw")).otherwise(pl.col("close_right"))
         else:
             prev_raw = pl.col("_prev_close_raw")
     elif "close_right" in df.columns:
+        prev_ref_reliable = pl.lit(True)
         prev_raw = pl.col("close_right")
     else:
+        prev_ref_reliable = pl.lit(False)
         prev_raw = pl.col("raw_close")
     is_risk_warning = pl.col("_is_st") if "_is_st" in df.columns else pl.lit(False)
     trade_date = pl.col("date") if "date" in df.columns else pl.lit(cn_today())
@@ -2236,8 +2300,13 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
             & pl.col("limit_up").is_not_null()
             & (pl.col("limit_up") >= _SENTINEL)
         )
+        # 权威价与理论价偏差超容差 → 维表滞后 (盘前同步拉到昨日涨跌停价), 回退理论价。
+        # 基准不可靠 (prev_raw 兜底到今收) 时保留权威价, 见 prev_ref_reliable 注释。
+        trust_auth_up = has_authoritative_up & (
+            ~prev_ref_reliable | _auth_limit_consistent(pl.col("limit_up"), limit_up_price)
+        )
         effective_limit_up = pl.when(
-            has_authoritative_up
+            trust_auth_up
         ).then(pl.col("limit_up")).otherwise(limit_up_price)
     else:
         effective_limit_up = limit_up_price
@@ -2248,11 +2317,48 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
             & (pl.col("limit_down") > 0)
             & (pl.col("limit_down") < _SENTINEL)
         )
+        trust_auth_down = has_authoritative_down & (
+            ~prev_ref_reliable | _auth_limit_consistent(pl.col("limit_down"), limit_down_price)
+        )
         effective_limit_down = pl.when(
-            has_authoritative_down
+            trust_auth_down
         ).then(pl.col("limit_down")).otherwise(limit_down_price)
     else:
         effective_limit_down = limit_down_price
+
+    # 权威价偏差超容差回退理论价的行数统计 (维表滞后观测)
+    _stale_flags: list[pl.Expr] = []
+    if "limit_up" in df.columns:
+        _stale_flags.append(
+            (
+                has_authoritative_up
+                & prev_ref_reliable
+                & ~_auth_limit_consistent(pl.col("limit_up"), limit_up_price)
+            ).fill_null(False).alias("_auth_stale_up")
+        )
+    if "limit_down" in df.columns:
+        _stale_flags.append(
+            (
+                has_authoritative_down
+                & prev_ref_reliable
+                & ~_auth_limit_consistent(pl.col("limit_down"), limit_down_price)
+            ).fill_null(False).alias("_auth_stale_down")
+        )
+    if _stale_flags:
+        df = df.with_columns(_stale_flags)
+        n_stale = int(
+            df.filter(
+                pl.any_horizontal(
+                    *[c for c in ("_auth_stale_up", "_auth_stale_down") if c in df.columns]
+                )
+            ).height
+        )
+        if n_stale:
+            logger.warning(
+                "权威涨跌停价与理论价偏差超容差, %d 行回退理论价 (instruments 维表疑似滞后, 检查盘前同步时机)",
+                n_stale,
+            )
+        df = df.drop([c for c in ("_auth_stale_up", "_auth_stale_down") if c in df.columns])
 
     valid_prev_raw = prev_raw.is_not_null() & (prev_raw > 0)
     is_limit_up = (
