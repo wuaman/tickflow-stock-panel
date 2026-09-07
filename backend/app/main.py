@@ -146,7 +146,7 @@ async def _application_lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         logger.warning("custom data sources init failed: %s", e)
 
-    # 能力探测
+    # 能力探测: 自定义源必须先注册, 探测才能补充其数据集能力
     capset = detect_capabilities()
     app.state.capabilities = capset
     logger.info("ready; %d capabilities active", len(capset.all()))
