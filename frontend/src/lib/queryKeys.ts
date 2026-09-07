@@ -82,6 +82,7 @@ export const QK = {
   extSeriesAll:        ['ext-series'] as const,
   extSeries:           (colsKey: string, date?: string | null, symbolsKey?: string) => ['ext-series', colsKey, date ?? '', symbolsKey ?? ''] as const,
   marketSnapshot:       ['market-snapshot'] as const,
+  fundamentalSnapshot:  ['fundamental-snapshot'] as const,
   limitLadder:          (asOf?: string) => ['limit-ladder', asOf] as const,
 
   // Backtest
