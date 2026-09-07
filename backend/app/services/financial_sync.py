@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -317,6 +318,19 @@ def sync_shares(data_dir: Path, capset: CapabilitySet, scope: str = "all") -> in
 EM_SUPPLEMENT_PROVIDER = "eastmoney_financial"
 _EM_SUPPLEMENT_HOUR = 16  # 每天本地 16:0x 触发 (A股盘后)
 
+# 补数分批: 龙头候选入自选后新自选可达百余只, 一次跑完请求数千级
+# (东财封 IP 阈值约 10 秒级持续 30 分钟; fuyao 429 约百次连发触发)。
+# 分批 + 批间隔把首跑摊到数小时(后台线程, 不阻塞事件循环), 失败股留下轮自动续。
+_SUPPLEMENT_BATCH = 10          # 每批股票数 (东财全量 / fuyao 深历史 / 指标逐期共用)
+_EM_BATCH_SLEEP_S = 60          # 东财批间隔(秒)
+_FUYAO_BATCH_SLEEP_S = 30       # fuyao 批间隔(秒)
+
+
+def _batched(symbols: list[str], size: int = _SUPPLEMENT_BATCH):
+    """切批生成器。"""
+    for i in range(0, len(symbols), size):
+        yield symbols[i : i + size]
+
 
 _FUYAO_DEEP_PREFS_KEY = "financials_fuyao_deep_symbols"
 
@@ -400,29 +414,40 @@ def sync_watchlist_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str
         "watchlist_supplement: %d 只自选股, 东财全量 %d / 增量 %d",
         len(symbols), len(deep_symbols), len(incr_symbols),
     )
+    def _merge_into_table(table: str, incoming: pl.DataFrame) -> int:
+        """incoming 合并进已有表并落盘(逐批调用, 中途失败已批不丢)。"""
+        existing = get_financial_df(data_dir, table)
+        if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
+            merged = _merge_report_history(incoming)
+        else:
+            merged = _merge_report_history(existing, incoming)
+        return _write_table(table, merged, data_dir)
+
     for table in FINANCIAL_TABLES:
         try:
-            frames: list[pl.DataFrame] = []
+            wrote = False
             if incr_symbols:
-                frames.append(_fetch_table(
+                frame = _fetch_table(
                     table, incr_symbols, capset, latest_only=True,
                     provider=EM_SUPPLEMENT_PROVIDER,
-                ))
-            if deep_symbols:
-                frames.append(_fetch_table(
-                    table, deep_symbols, capset, latest_only=False,
+                )
+                if not frame.is_empty():
+                    results[table] = _merge_into_table(table, frame)
+                    wrote = True
+            # 东财全量历史分批拉取(批间隔防封 IP), 逐批合并落盘
+            for bi, chunk in enumerate(_batched(deep_symbols)):
+                if bi:
+                    time.sleep(_EM_BATCH_SLEEP_S)
+                chunk_df = _fetch_table(
+                    table, chunk, capset, latest_only=False,
                     provider=EM_SUPPLEMENT_PROVIDER,
-                ))
-            frames = [f for f in frames if not f.is_empty()]
-            if not frames:
+                )
+                if chunk_df.is_empty():
+                    continue
+                results[table] = _merge_into_table(table, chunk_df)
+                wrote = True
+            if not wrote:
                 results[table] = 0
-                continue
-            existing = get_financial_df(data_dir, table)
-            if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
-                merged = _merge_report_history(*frames)
-            else:
-                merged = _merge_report_history(existing, *frames)
-            results[table] = _write_table(table, merged, data_dir)
         except Exception as e:  # noqa: BLE001
             logger.warning("watchlist_supplement em %s failed: %s", table, e)
             results[table] = -1
@@ -435,25 +460,32 @@ def sync_watchlist_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str
             len(fy_pending), fy_pending,
         )
         fy_fetched: set[str] = set()
-        for table in ("metrics", "income", "balance_sheet", "cash_flow"):
+        # 三大报表 + 指标逐期分批拉(批间隔防 429); 逐批落盘, 失败股留下轮重试
+        fy_batches = list(_batched(fy_pending))
+        for bi, chunk in enumerate(fy_batches):
+            if bi:
+                time.sleep(_FUYAO_BATCH_SLEEP_S)
+            logger.info(
+                "watchlist_supplement fuyao_deep: 批 %d/%d (%d 只)",
+                bi + 1, len(fy_batches), len(chunk),
+            )
+            for table in ("income", "balance_sheet", "cash_flow"):
+                try:
+                    fy_full = _fetch_table(table, chunk, capset, latest_only=False)
+                    if not fy_full.is_empty():
+                        fy_fetched.update(fy_full["symbol"].unique().to_list())
+                        _merge_into_table(table, fy_full)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("watchlist_supplement fuyao_deep %s failed: %s", table, e)
             try:
-                if table == "metrics":
-                    # 指标历史只能 fuyao 提供 (ROA/资产负债率等), 逐期查请求量大,
-                    # 仅此处调用; 全市场 metrics 同步恒只刷最新一期
-                    fy_full = _fuyao_metrics_history(fy_pending)
-                else:
-                    fy_full = _fetch_table(table, fy_pending, capset, latest_only=False)
-                if fy_full.is_empty():
-                    continue
-                fy_fetched.update(fy_full["symbol"].unique().to_list())
-                existing = get_financial_df(data_dir, table)
-                if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
-                    merged = _merge_report_history(fy_full)
-                else:
-                    merged = _merge_report_history(existing, fy_full)
-                _write_table(table, merged, data_dir)
+                # 指标历史只能 fuyao 提供 (ROA/资产负债率等), 逐期查请求量大,
+                # 仅此处调用; 全市场 metrics 同步恒只刷最新一期
+                fy_metrics = _fuyao_metrics_history(chunk)
+                if not fy_metrics.is_empty():
+                    fy_fetched.update(fy_metrics["symbol"].unique().to_list())
+                    _merge_into_table("metrics", fy_metrics)
             except Exception as e:  # noqa: BLE001
-                logger.warning("watchlist_supplement fuyao_deep %s failed: %s", table, e)
+                logger.warning("watchlist_supplement fuyao_deep metrics failed: %s", e)
         # 只记成功拉到的股票; 因 429 等失败的下轮重试
         if fy_fetched:
             _mark_fuyao_deep_done(sorted(fy_fetched))
@@ -461,6 +493,122 @@ def sync_watchlist_supplement(data_dir: Path, capset: CapabilitySet) -> dict[str
 
     _refresh_financials_views(data_dir)
     logger.info("watchlist_supplement done: %s", results)
+    return results
+
+
+def sync_leader_candidates(data_dir: Path, capset: CapabilitySet) -> dict:
+    """行业龙头候选独立补数 (与自选股通道完全解耦, 不读不写 watchlist)。
+
+    候选清单来自 preferences.industry_leader_candidates (industry_leaders 管理):
+    - 未补过深历史的: 东财全量历史 + fuyao 深历史(三大报表+指标逐期),
+      分批 + 批间隔, 首跑(约 450 只)后台约 2~3 小时;
+    - 已补过的: 每天仅东财增量(拉最新一期, batch=20 打包, 请求量很小),
+      fuyao 侧不重复拉(新期由全市场常规同步覆盖)。
+    429/失败股不记 done, 下轮自动重试。每天 16:07 调度执行。
+    """
+    from app.services.industry_leaders import list_candidates, _done_symbols, _mark_done
+
+    symbols = list_candidates()
+    if not symbols:
+        logger.info("leader_candidates sync skipped: 候选清单为空")
+        return {}
+    main_provider = preferences.get_financial_provider()
+    if main_provider == EM_SUPPLEMENT_PROVIDER:
+        return {}  # 主源就是东财, 无需补充
+    if not _provider_is_custom(EM_SUPPLEMENT_PROVIDER):
+        logger.info("leader_candidates sync skipped: eastmoney_financial 源未配置")
+        return {}
+
+    data_dir = Path(data_dir)
+    results: dict[str, int] = {}
+
+    def _merge_into_table(table: str, incoming: pl.DataFrame) -> int:
+        existing = get_financial_df(data_dir, table)
+        if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
+            merged = _merge_report_history(incoming)
+        else:
+            merged = _merge_report_history(existing, incoming)
+        return _write_table(table, merged, data_dir)
+
+    # ---- 1. 东财: 已覆盖的增量(最新一期), 未覆盖的全量历史(分批防封) ----
+    existing_income = get_financial_df(data_dir, "income")
+    em_covered: set[str] = set()
+    if not existing_income.is_empty() and "name" in existing_income.columns:
+        em_covered = set(
+            existing_income.filter(pl.col("name").is_not_null())["symbol"]
+            .unique().to_list()
+        )
+    deep = [s for s in symbols if s not in em_covered]
+    incr = [s for s in symbols if s in em_covered]
+    logger.info(
+        "leader_candidates sync: %d 只候选, 东财全量 %d / 增量 %d",
+        len(symbols), len(deep), len(incr),
+    )
+    for table in FINANCIAL_TABLES:
+        try:
+            wrote = False
+            if incr:
+                frame = _fetch_table(
+                    table, incr, capset, latest_only=True,
+                    provider=EM_SUPPLEMENT_PROVIDER,
+                )
+                if not frame.is_empty():
+                    results[table] = _merge_into_table(table, frame)
+                    wrote = True
+            for bi, chunk in enumerate(_batched(deep)):
+                if bi:
+                    time.sleep(_EM_BATCH_SLEEP_S)
+                chunk_df = _fetch_table(
+                    table, chunk, capset, latest_only=False,
+                    provider=EM_SUPPLEMENT_PROVIDER,
+                )
+                if chunk_df.is_empty():
+                    continue
+                results[table] = _merge_into_table(table, chunk_df)
+                wrote = True
+            if not wrote:
+                results[table] = 0
+        except Exception as e:  # noqa: BLE001
+            logger.warning("leader_candidates em %s failed: %s", table, e)
+            results[table] = -1
+
+    # ---- 2. fuyao 深历史: 每只候选一次性(三大报表+指标逐期), 分批防 429 ----
+    done = _done_symbols()
+    fy_pending = [s for s in symbols if s not in done]
+    if fy_pending:
+        logger.info(
+            "leader_candidates fuyao_deep: %d 只候选补 fuyao 全量历史", len(fy_pending),
+        )
+        fy_fetched: set[str] = set()
+        fy_batches = list(_batched(fy_pending))
+        for bi, chunk in enumerate(fy_batches):
+            if bi:
+                time.sleep(_FUYAO_BATCH_SLEEP_S)
+            logger.info(
+                "leader_candidates fuyao_deep: 批 %d/%d (%d 只)",
+                bi + 1, len(fy_batches), len(chunk),
+            )
+            for table in ("income", "balance_sheet", "cash_flow"):
+                try:
+                    fy_full = _fetch_table(table, chunk, capset, latest_only=False)
+                    if not fy_full.is_empty():
+                        fy_fetched.update(fy_full["symbol"].unique().to_list())
+                        _merge_into_table(table, fy_full)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("leader_candidates fuyao_deep %s failed: %s", table, e)
+            try:
+                fy_metrics = _fuyao_metrics_history(chunk)
+                if not fy_metrics.is_empty():
+                    fy_fetched.update(fy_metrics["symbol"].unique().to_list())
+                    _merge_into_table("metrics", fy_metrics)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("leader_candidates fuyao_deep metrics failed: %s", e)
+        if fy_fetched:
+            _mark_done(sorted(fy_fetched))
+            logger.info("leader_candidates: fuyao 深历史完成 %d 只", len(fy_fetched))
+
+    _refresh_financials_views(data_dir)
+    logger.info("leader_candidates sync done: %s", results)
     return results
 
 
@@ -700,6 +848,19 @@ class FinancialScheduler:
                     await asyncio.sleep(60)
                 if not self._running:
                     return
+                try:
+                    # 年度候选刷新(5/6 后首跑): 更新清单后新候选当天即进入补数
+                    from app.services.industry_leaders import refresh_if_due
+                    await asyncio.to_thread(refresh_if_due, self._data_dir)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("industry_leaders refresh failed: %s", e)
+                try:
+                    # 行业龙头候选独立补数 (新候选深历史 / 已补候选仅增量)
+                    await asyncio.to_thread(
+                        sync_leader_candidates, self._data_dir, self._capset
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("leader_candidates loop failed: %s", e)
                 try:
                     await asyncio.to_thread(
                         sync_watchlist_supplement, self._data_dir, self._capset

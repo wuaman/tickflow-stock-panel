@@ -150,6 +150,9 @@ export const storage = {
   /** 行业分析页面字段配置 */
   industryAnalysisConfig: kv<Record<string, any>>('industry-analysis-config'),
 
+  /** 行业分析龙头区模式: 'pop' 人气龙头 | 'fund' 基本面龙头 */
+  industryLeaderMode: kv<'pop' | 'fund'>('industry-leader-mode'),
+
   /** 数据页画像卡片显隐 (卡片key → 是否显示) */
   dataCardVisible: kv<Record<string, boolean>>('data-card-visible'),
   /** 数据页画像卡片顺序 (卡片key 数组, 长度=卡片总数) */

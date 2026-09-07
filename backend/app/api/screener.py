@@ -497,6 +497,54 @@ def market_snapshot(request: Request):
     return {"as_of": str(as_of), "rows": rows}
 
 
+@router.get("/fundamental-snapshot")
+def fundamental_snapshot(request: Request):
+    """最新期基本面快照(市值 + 每股最新一期财务指标), 供行业/概念分析的基本面龙头模式使用。
+
+    只返回原始指标, 行业内归一化与打分由前端完成。数据组装见
+    app/services/industry_leaders.load_fundamental_snapshot (与行业候选计算共用)。
+    """
+    from app.services.industry_leaders import load_fundamental_snapshot
+
+    as_of, base = load_fundamental_snapshot(
+        request.app.state.repo.store.data_dir, repo=request.app.state.repo
+    )
+    if as_of is None:
+        return {"as_of": None, "rows": []}
+
+    rows = base.to_dicts() if not base.is_empty() else []
+    for r in rows:
+        for k, v in list(r.items()):
+            if isinstance(v, float) and not math.isfinite(v):
+                r[k] = None
+            elif hasattr(v, "isoformat"):  # date/datetime → ISO 字符串
+                r[k] = v.isoformat()
+
+    return {"as_of": as_of, "rows": rows}
+
+
+class LeaderCandidatesRequest(BaseModel):
+    top_n: int = 5
+
+
+@router.post("/industry-leader-candidates")
+def industry_leader_candidates(request: Request, req: Optional[LeaderCandidatesRequest] = None):
+    """基本面初筛 Top N → 更新候选清单 (preferences, 不碰自选股)。
+
+    手动按钮与年度自动刷新共用此逻辑; 入榜者待补数通道拉深历史, 落榜者
+    停止增量(parquet 数据保留)。候选补数由每日 16:07 调度独立执行。
+    """
+    from app.services.industry_leaders import update_candidates
+
+    top_n = (req.top_n if req else 5) or 5
+    if not 1 <= top_n <= 20:
+        raise HTTPException(400, f"top_n 需在 1..20, got {top_n}")
+    result = update_candidates(request.app.state.repo.store.data_dir, top_n=top_n)
+    if result.get("status") != "ok":
+        raise HTTPException(409, result.get("message") or "候选计算失败")
+    return result
+
+
 @router.post("/run_all")
 def run_all(request: Request, body: Optional[dict] = None):
     """批量运行指定策略；注册、路由和执行均由 StrategyEngine 负责。"""

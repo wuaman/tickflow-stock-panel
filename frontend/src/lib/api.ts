@@ -397,6 +397,23 @@ export interface MarketSnapshotRow {
   [key: string]: any
 }
 
+/** 基本面快照行 (每股最新一期财务指标 + 最新市值) */
+export interface FundamentalRow {
+  symbol: string
+  name?: string | null
+  market_cap?: number | null
+  float_market_cap?: number | null
+  roe?: number | null
+  gross_margin?: number | null
+  net_margin?: number | null
+  revenue_yoy?: number | null
+  revenue?: number | null
+  /** metrics 报告期, 如 2026-06-30 */
+  period_end?: string | null
+  income_period?: string | null
+  listing_date?: string | null
+}
+
 export interface OverviewDimensionRankItem {
   name: string
   count: number
@@ -2485,6 +2502,22 @@ export const api = {
     ),
   marketSnapshot: () =>
     request<{ as_of: string | null; rows: MarketSnapshotRow[] }>('/api/screener/market-snapshot'),
+  fundamentalSnapshot: () =>
+    request<{ as_of: string | null; rows: FundamentalRow[] }>('/api/screener/fundamental-snapshot'),
+  /** 基本面初筛 Top N → 更新候选清单(preferences, 不碰自选); 补数由每日 16:07 调度执行 */
+  industryLeaderCandidates: (topN: number = 5) =>
+    request<{
+      status: string
+      as_of: string
+      industries: number
+      candidates: number
+      added: string[]
+      removed: string[]
+      by_industry: Record<string, string[]>
+    }>('/api/screener/industry-leader-candidates', {
+      method: 'POST',
+      body: JSON.stringify({ top_n: topN }),
+    }),
   overviewMarket: (asOf?: string) => request<OverviewMarket>(`/api/overview/market${asOf ? `?as_of=${asOf}` : ''}`),
 
   // 概念涨幅轮动矩阵: 每列(日期)各自把所有概念按当天涨幅从高到低排序
