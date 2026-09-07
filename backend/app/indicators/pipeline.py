@@ -2239,14 +2239,18 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
     df = df.join(inst_subset, on="symbol", how="left", suffix="_inst")
 
     # 换手率: API 有则直接用, 无则从 float_shares 计算
-    if "turnover_rate" not in df.columns:
-        if "float_shares" in df.columns and "volume" in df.columns:
-            df = df.with_columns(
-                pl.when(pl.col("float_shares") > 0)
-                  .then(pl.col("volume") * 10000.0 / pl.col("float_shares"))
-                  .otherwise(None)
-                  .alias("turnover_rate")
-            )
+    # 注意按值判断而非列存在性: fuyao 等源 ext.turnover_rate 恒为 None,
+    # _build_quote_extra 仍会带出全 null 列, 若只查列存在会让股本回退永不触发。
+    if "float_shares" in df.columns and "volume" in df.columns:
+        computed = (
+            pl.when(pl.col("float_shares") > 0)
+              .then(pl.col("volume") * 10000.0 / pl.col("float_shares"))
+              .otherwise(None)
+        )
+        if "turnover_rate" in df.columns:
+            df = df.with_columns(pl.coalesce("turnover_rate", computed).alias("turnover_rate"))
+        else:
+            df = df.with_columns(computed.alias("turnover_rate"))
 
     # 涨跌停 (用 raw_close / raw_high 和前一日原始收盘价)
     # 优先用 API 原始前收盘价, 回退到 close_right, 最后回退到 raw_close

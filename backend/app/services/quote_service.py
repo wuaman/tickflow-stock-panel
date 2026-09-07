@@ -997,6 +997,12 @@ class QuoteService:
         if not keep or "symbol" not in keep:
             return pl.DataFrame()
         out = df.select(keep)
+        # 全 null 的 ext 列 (如 fuyao 恒不提供 turnover_rate/amplitude) 整列丢弃:
+        # 下游 compute_enriched_today / _compute_limit_signals_today 按列存在性
+        # 决定是否启用自有计算, 全 null 列会挡住换手率股本回退等计算路径。
+        for c in ("change_pct", "change_amount", "amplitude", "turnover_rate"):
+            if c in out.columns and out[c].null_count() == out.height:
+                out = out.drop(c)
         # 实时 API 的 turnover_rate 入口契约为小数制(0.05 = 5%).
         # enriched 内部统一存百分数值(5 = 5%), 后续页面/筛选直接展示和比较。
         if "turnover_rate" in out.columns:
