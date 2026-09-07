@@ -507,6 +507,7 @@ def sync_leader_candidates(data_dir: Path, capset: CapabilitySet) -> dict:
     429/失败股不记 done, 下轮自动重试。每天 16:07 调度执行。
     """
     from app.services.industry_leaders import list_candidates, _done_symbols, _mark_done
+    from app.services import preferences
 
     symbols = list_candidates()
     if not symbols:
