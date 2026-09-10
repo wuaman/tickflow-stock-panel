@@ -10,6 +10,12 @@
 
 import type { ExtDataConfig, ExtDataField, ExtDataRowsResult } from '@/lib/api'
 
+// A股正常交易日涨跌幅上限: 主板 ±10% / 创业板·科创板 ±20% / 北交所 ±30%。
+// 首日上市新股无涨跌停 (相对发行价可 >100%), 其"涨幅"不是日涨跌幅。
+// 聚合时剔除 |change_pct| > 44% 的异常值 —— 唯一来源是首日新股或脏数据。
+// (后端已把首日新股 change_pct 置空, 此处是前端兜底, 防其他数据源引入异常值。)
+export const MAX_DAILY_PCT = 0.44
+
 // ===== 公共类型 =====
 
 export interface StockRow {
@@ -330,7 +336,7 @@ export function computeQuoteMetrics(
     const q = quoteMap.get(sym) ?? quoteMap.get(sym.replace(/\.\w+$/, ''))
     if (!q) continue
     const pct = q.pct ?? q.change_pct
-    if (pct != null && typeof pct === 'number' && Number.isFinite(pct)) {
+    if (pct != null && typeof pct === 'number' && Number.isFinite(pct) && Math.abs(pct) <= MAX_DAILY_PCT) {
       sumPct += pct
       countPct++
       if (pct > 0) up++

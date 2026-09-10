@@ -1964,6 +1964,15 @@ def compute_enriched_today(
               .alias("amplitude"),
         )
 
+    # 首日上市新股无"昨收": API 直接提供的 change_pct/change_amount 是相对发行价的
+    # 首日涨跌(可 >100%), 不属于"日涨跌幅"。置空对齐日线口径 (close.shift(1)=null),
+    # 避免一只新股把行业/概念聚合的平均涨幅拉爆。has_history_state=False 即"90 天
+    # 历史窗口内无任何 K 线"的标的 (首日新股; 停牌<90 天的复牌股仍有停牌前状态)。
+    df = df.with_columns([
+        pl.when(has_history_state).then(pl.col("change_pct")).otherwise(None).alias("change_pct"),
+        pl.when(has_history_state).then(pl.col("change_amount")).otherwise(None).alias("change_amount"),
+    ])
+
     # ---- EMA (递推) ----
     df = df.with_columns([
         (alpha(5)  * pl.col("close") + (1 - alpha(5))  * pl.col("ema5")).alias("ema5"),
