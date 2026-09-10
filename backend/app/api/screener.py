@@ -527,6 +527,51 @@ class LeaderCandidatesRequest(BaseModel):
     top_n: int = 5
 
 
+@router.get("/fundamental-history")
+def fundamental_history(request: Request, symbols: str = Query("", description="逗号分隔 symbol 列表")):
+    """每股年报序列(roe/毛利率/营收/净利/增速) + 近 5 年摘要, 供基本面龙头深验证。
+
+    has_deep=false 表示深历史未补(只有全市场 8 期存量), 前端渲染"待补数"态。
+    """
+    from app.services.industry_leaders import load_fundamental_history
+
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not syms:
+        return {"rows": {}}
+    if len(syms) > 200:
+        raise HTTPException(400, f"symbols 最多 200 个, got {len(syms)}")
+    data = load_fundamental_history(request.app.state.repo.store.data_dir, syms)
+    for v in data.values():
+        for p in v.get("periods") or []:
+            for k, val in list(p.items()):
+                if isinstance(val, float) and not math.isfinite(val):
+                    p[k] = None
+        s = v.get("summary")
+        if s:
+            for k, val in list(s.items()):
+                if isinstance(val, float) and not math.isfinite(val):
+                    s[k] = None
+    return {"rows": data}
+
+
+@router.get("/mcap-trajectory")
+def mcap_trajectory(request: Request, symbols: str = Query("", description="逗号分隔 symbol 列表(建议整个行业成员)")):
+    """近 5 年季度末行业内市值份额轨迹(历史价×当前股本近似, 纯本地 K 线)。"""
+    from app.services.industry_leaders import load_mcap_trajectory
+
+    syms = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not syms:
+        return {"rows": {}}
+    if len(syms) > 300:
+        raise HTTPException(400, f"symbols 最多 300 个, got {len(syms)}")
+    data = load_mcap_trajectory(request.app.state.repo.store.data_dir, syms)
+    for v in data.values():
+        for k in ("start_share", "end_share"):
+            if isinstance(v.get(k), float) and not math.isfinite(v[k]):
+                v[k] = None
+    return {"rows": data}
+
+
 @router.post("/industry-leader-candidates")
 def industry_leader_candidates(request: Request, req: Optional[LeaderCandidatesRequest] = None):
     """基本面初筛 Top N → 更新候选清单 (preferences, 不碰自选股)。

@@ -17,7 +17,7 @@ import { EmptyState } from '@/components/EmptyState'
 import { AnalysisConfigDialog, DimensionHeatmap, PresetFetchState, type AnalysisFieldConfig } from '@/components/analysis-shared'
 import { StockPreviewDialog, toNavItems, type NavItem } from '@/components/StockPreviewDialog'
 import { RpsRotationDialog } from '@/components/RpsRotationDialog'
-import { api, type FundamentalRow, type MarketSnapshotRow } from '@/lib/api'
+import { api, type FundamentalHistoryRow, type FundamentalRow, type MarketSnapshotRow, type McapTrajectoryRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
 import { fmtBigNum, fmtPct, priceColorClass } from '@/lib/format'
@@ -200,6 +200,10 @@ interface FundCalc {
   period: string | null
   /** 银行等毛利率口径无意义的行业 */
   hideGm: boolean
+  /** 深历史: symbol → 年报序列 + 近5年摘要 (Phase 3) */
+  history: Record<string, FundamentalHistoryRow>
+  /** 市值份额轨迹: symbol → 序列 (Phase 4) */
+  trajectory: Record<string, McapTrajectoryRow>
 }
 
 function buildFundMap(rows: FundamentalRow[]) {
@@ -224,7 +228,13 @@ function minmax(values: number[]): (v: number) => number {
  *  缺失因子取 0.5(中性), 权重归一化分母保持一致以保证跨股票可比。 */
 const FUND_WEIGHTS = { mcap: 0.35, roe: 0.25, gm: 0.2, revenue: 0.2 }
 
-function calcFundamentals(stocks: EnrichedStock[], fundMap: Map<string, FundamentalRow>, industryKey: string): FundCalc | null {
+function calcFundamentals(
+  stocks: EnrichedStock[],
+  fundMap: Map<string, FundamentalRow>,
+  industryKey: string,
+  history: Record<string, FundamentalHistoryRow> = {},
+  trajectory: Record<string, McapTrajectoryRow> = {},
+): FundCalc | null {
   const hideGm = industryKey.includes('银行')
   const oneYearAgo = Date.now() - 365 * 24 * 3600 * 1000
 
@@ -309,7 +319,7 @@ function calcFundamentals(stocks: EnrichedStock[], fundMap: Map<string, Fundamen
   }
   const period = [...periodCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null
 
-  return { rows, totalMcap, totalRevenue, period, hideGm }
+  return { rows, totalMcap, totalRevenue, period, hideGm, history, trajectory }
 }
 
 // ===== 行业统计计算 =====
@@ -933,7 +943,26 @@ function IndustryFocus({ stat, leaderMode, onLeaderMode, fundMap, fundLoading, o
   if (!stat) return null
   const stocks = [...stat.stocks].sort((a, b) => b.leaderScore - a.leaderScore).slice(0, MAX_RENDERED_STOCKS)
   const topLeaders = stocks.slice(0, 3)
-  const fund = leaderMode === 'fund' ? calcFundamentals(stat.stocks, fundMap, stat.key) : null
+
+  // 深历史 + 市值轨迹: 只在基本面模式拉取(序列低频, staleTime 当日)
+  const industrySymbols = useMemo(() => stat.stocks.map(s => s.symbol), [stat])
+  const symbolsKey = industrySymbols.join(',')
+  const historyQuery = useQuery({
+    queryKey: QK.fundamentalHistory(symbolsKey),
+    queryFn: () => api.fundamentalHistory(industrySymbols),
+    enabled: leaderMode === 'fund' && industrySymbols.length > 0,
+    staleTime: 6 * 3600_000,
+  })
+  const trajectoryQuery = useQuery({
+    queryKey: QK.mcapTrajectory(symbolsKey),
+    queryFn: () => api.mcapTrajectory(industrySymbols),
+    enabled: leaderMode === 'fund' && industrySymbols.length > 0,
+    staleTime: 6 * 3600_000,
+  })
+
+  const fund = leaderMode === 'fund'
+    ? calcFundamentals(stat.stocks, fundMap, stat.key, historyQuery.data?.rows ?? {}, trajectoryQuery.data?.rows ?? {})
+    : null
   const fundTop = fund ? fund.rows.filter(r => r.eligible).slice(0, 3) : []
   const focusNav: NavItem[] = toNavItems(leaderMode === 'fund' && fund ? fund.rows.slice(0, MAX_RENDERED_STOCKS).map(r => r.stock) : stocks)
   return (
@@ -967,6 +996,8 @@ function IndustryFocus({ stat, leaderMode, onLeaderMode, fundMap, fundLoading, o
         <LeaderStage
           stocks={topLeaders}
           fundStocks={fundTop}
+          history={fund?.history}
+          trajectory={fund?.trajectory}
           mode={leaderMode}
           onModeChange={onLeaderMode}
           activeSymbol={activeSymbol}
@@ -974,39 +1005,39 @@ function IndustryFocus({ stat, leaderMode, onLeaderMode, fundMap, fundLoading, o
         />
         {leaderMode === 'pop'
           ? <ScoreExplain stock={topLeaders[0]} />
-          : <FundExplain stock={fundTop[0]} hideGm={fund?.hideGm ?? false} />}
+          : <FundExplain stock={fundTop[0]} hideGm={fund?.hideGm ?? false} history={fund?.history} />}
       </div>
 
       {leaderMode === 'pop' ? (
         <>
           <div className="min-h-0 flex-1 overflow-auto">
-            <table className="min-w-full text-left text-xs">
-              <thead className="bg-elevated/60 text-[11px] text-muted">
+            <table className="min-w-full border-separate border-spacing-0 text-left text-xs">
+              <thead className="sticky top-0 z-10 bg-surface text-[11px] text-muted shadow-[0_1px_0_0_hsl(var(--border))]">
                 <tr>
-                  <th className="px-4 py-2 font-medium">排名</th>
-                  <th className="px-4 py-2 font-medium">股票</th>
-                  <th className="px-4 py-2 font-medium">涨跌幅</th>
-                  <th className="px-4 py-2 font-medium">换手率</th>
-                  <th className="px-4 py-2 font-medium">成交额</th>
-                  <th className="px-4 py-2 font-medium">流通市值</th>
-                  <th className="px-4 py-2 font-medium">量比</th>
-                  <th className="px-4 py-2 font-medium">龙头分</th>
+                  <th className="border-b border-border/50 px-4 py-2 font-medium">排名</th>
+                  <th className="border-b border-border/50 px-4 py-2 font-medium">股票</th>
+                  <th className="border-b border-border/50 px-4 py-2 font-medium">涨跌幅</th>
+                  <th className="border-b border-border/50 px-4 py-2 font-medium">换手率</th>
+                  <th className="border-b border-border/50 px-4 py-2 font-medium">成交额</th>
+                  <th className="border-b border-border/50 px-4 py-2 font-medium">流通市值</th>
+                  <th className="border-b border-border/50 px-4 py-2 font-medium">量比</th>
+                  <th className="border-b border-border/50 px-4 py-2 font-medium">龙头分</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-border/70">
+              <tbody>
                 {stocks.map((s, idx) => (
                   <tr key={`${s.symbol}-${idx}`} className={cn('cursor-pointer', s.symbol === activeSymbol ? 'bg-accent/10 hover:bg-accent/15' : 'hover:bg-elevated/30')} onClick={() => onStockClick(s.symbol, s.name || undefined, focusNav)}>
-                    <td className="px-4 py-2 font-mono text-muted">{idx + 1}</td>
-                    <td className="px-4 py-2">
+                    <td className="border-b border-border/50 px-4 py-2 font-mono text-muted">{idx + 1}</td>
+                    <td className="border-b border-border/50 px-4 py-2">
                       <div className="font-medium text-foreground">{s.name || '—'}</div>
                       <div className="font-mono text-[10px] text-muted">{s.symbol}</div>
                     </td>
-                    <td className={cn('px-4 py-2 font-mono tabular-nums', priceColorClass(s.change_pct))}>{s.change_pct != null ? fmtPct(s.change_pct) : '—'}</td>
-                    <td className="px-4 py-2 font-mono text-foreground">{s.turnover_rate != null ? `${s.turnover_rate.toFixed(2)}%` : '—'}</td>
-                    <td className="px-4 py-2 font-mono text-foreground">{fmtBigNum(s.amount)}</td>
-                    <td className="px-4 py-2 font-mono text-foreground">{fmtBigNum(s.float_market_cap ?? s.market_cap)}</td>
-                    <td className="px-4 py-2 font-mono text-foreground">{s.vol_ratio_5d != null ? s.vol_ratio_5d.toFixed(2) : '—'}</td>
-                    <td className="px-4 py-2">
+                    <td className={cn('border-b border-border/50 px-4 py-2 font-mono tabular-nums', priceColorClass(s.change_pct))}>{s.change_pct != null ? fmtPct(s.change_pct) : '—'}</td>
+                    <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.turnover_rate != null ? `${s.turnover_rate.toFixed(2)}%` : '—'}</td>
+                    <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{fmtBigNum(s.amount)}</td>
+                    <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{fmtBigNum(s.float_market_cap ?? s.market_cap)}</td>
+                    <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.vol_ratio_5d != null ? s.vol_ratio_5d.toFixed(2) : '—'}</td>
+                    <td className="border-b border-border/50 px-4 py-2">
                       <div className="flex items-center gap-2">
                         <span className="w-9 font-mono text-amber-300">{s.leaderScore.toFixed(0)}</span>
                         <div className="h-1.5 w-16 rounded-full bg-elevated"><div className="h-full rounded-full bg-amber-300" style={{ width: `${Math.max(4, s.leaderScore)}%` }} /></div>
@@ -1025,35 +1056,35 @@ function IndustryFocus({ stat, leaderMode, onLeaderMode, fundMap, fundLoading, o
             {fundLoading ? (
               <div className="px-4 py-10 text-center text-sm text-muted">正在加载基本面数据...</div>
             ) : fund ? (
-              <table className="min-w-full text-left text-xs">
-                <thead className="bg-elevated/60 text-[11px] text-muted">
+              <table className="min-w-full border-separate border-spacing-0 text-left text-xs">
+                <thead className="sticky top-0 z-10 bg-surface text-[11px] text-muted shadow-[0_1px_0_0_hsl(var(--border))]">
                   <tr>
-                    <th className="px-4 py-2 font-medium">排名</th>
-                    <th className="px-4 py-2 font-medium">股票</th>
-                    <th className="px-4 py-2 font-medium">涨跌幅</th>
-                    <th className="px-4 py-2 font-medium">总市值</th>
-                    <th className="px-4 py-2 font-medium">市值份额</th>
-                    <th className="px-4 py-2 font-medium">ROE</th>
-                    {!fund.hideGm && <th className="px-4 py-2 font-medium">毛利率</th>}
-                    <th className="px-4 py-2 font-medium">营收份额</th>
-                    <th className="px-4 py-2 font-medium">基本面分</th>
+                    <th className="border-b border-border/50 px-4 py-2 font-medium">排名</th>
+                    <th className="border-b border-border/50 px-4 py-2 font-medium">股票</th>
+                    <th className="border-b border-border/50 px-4 py-2 font-medium">涨跌幅</th>
+                    <th className="border-b border-border/50 px-4 py-2 font-medium">总市值</th>
+                    <th className="border-b border-border/50 px-4 py-2 font-medium">市值份额</th>
+                    <th className="border-b border-border/50 px-4 py-2 font-medium">ROE</th>
+                    {!fund.hideGm && <th className="border-b border-border/50 px-4 py-2 font-medium">毛利率</th>}
+                    <th className="border-b border-border/50 px-4 py-2 font-medium">营收份额</th>
+                    <th className="border-b border-border/50 px-4 py-2 font-medium">基本面分</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-border/70">
+                <tbody>
                   {fund.rows.slice(0, MAX_RENDERED_STOCKS).map((s, idx) => (
                     <tr key={`${s.symbol}-${idx}`} className={cn('cursor-pointer', !s.eligible && 'opacity-45', s.symbol === activeSymbol ? 'bg-accent/10 hover:bg-accent/15' : 'hover:bg-elevated/30')} onClick={() => onStockClick(s.symbol, s.name || undefined, focusNav)}>
-                      <td className="px-4 py-2 font-mono text-muted">{idx + 1}</td>
-                      <td className="px-4 py-2">
+                      <td className="border-b border-border/50 px-4 py-2 font-mono text-muted">{idx + 1}</td>
+                      <td className="border-b border-border/50 px-4 py-2">
                         <div className="font-medium text-foreground">{s.name || '—'}</div>
                         <div className="font-mono text-[10px] text-muted">{s.symbol}</div>
                       </td>
-                      <td className={cn('px-4 py-2 font-mono tabular-nums', priceColorClass(s.stock.change_pct))}>{s.stock.change_pct != null ? fmtPct(s.stock.change_pct) : '—'}</td>
-                      <td className="px-4 py-2 font-mono text-foreground">{s.marketCap != null ? fmtBigNum(s.marketCap) : '—'}</td>
-                      <td className="px-4 py-2 font-mono text-foreground">{s.mcapShare != null ? `${(s.mcapShare * 100).toFixed(1)}%` : '—'}</td>
-                      <td className="px-4 py-2 font-mono text-foreground">{s.roe != null ? `${s.roe.toFixed(1)}%` : '—'}</td>
-                      {!fund.hideGm && <td className="px-4 py-2 font-mono text-foreground">{s.grossMargin != null ? `${s.grossMargin.toFixed(1)}%` : '—'}</td>}
-                      <td className="px-4 py-2 font-mono text-foreground">{s.revenueShare != null ? `${(s.revenueShare * 100).toFixed(1)}%` : '—'}</td>
-                      <td className="px-4 py-2">
+                      <td className={cn('border-b border-border/50 px-4 py-2 font-mono tabular-nums', priceColorClass(s.stock.change_pct))}>{s.stock.change_pct != null ? fmtPct(s.stock.change_pct) : '—'}</td>
+                      <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.marketCap != null ? fmtBigNum(s.marketCap) : '—'}</td>
+                      <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.mcapShare != null ? `${(s.mcapShare * 100).toFixed(1)}%` : '—'}</td>
+                      <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.roe != null ? `${s.roe.toFixed(1)}%` : '—'}</td>
+                      {!fund.hideGm && <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.grossMargin != null ? `${s.grossMargin.toFixed(1)}%` : '—'}</td>}
+                      <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.revenueShare != null ? `${(s.revenueShare * 100).toFixed(1)}%` : '—'}</td>
+                      <td className="border-b border-border/50 px-4 py-2">
                         {s.eligible ? (
                           <div className="flex items-center gap-2">
                             <span className="w-9 font-mono text-cyan-300">{s.score.toFixed(0)}</span>
@@ -1106,9 +1137,11 @@ function LeaderModeToggle({ mode, onChange }: { mode: LeaderMode; onChange: (m: 
   )
 }
 
-function LeaderStage({ stocks, fundStocks, mode, onModeChange, onStockClick, activeSymbol }: {
+function LeaderStage({ stocks, fundStocks, history, trajectory, mode, onModeChange, onStockClick, activeSymbol }: {
   stocks: EnrichedStock[]
   fundStocks: FundStock[]
+  history?: Record<string, FundamentalHistoryRow>
+  trajectory?: Record<string, McapTrajectoryRow>
   mode: LeaderMode
   onModeChange: (m: LeaderMode) => void
   onStockClick: (symbol: string, name?: string) => void
@@ -1171,6 +1204,7 @@ function LeaderStage({ stocks, fundStocks, mode, onModeChange, onStockClick, act
                   <span>ROE {stock.roe != null ? `${stock.roe.toFixed(1)}%` : '—'}</span>
                   {stock.mcapShare != null && <span>份额 {(stock.mcapShare * 100).toFixed(0)}%</span>}
                 </div>
+                <DeepHistoryBadges symbol={stock.symbol} history={history} trajectory={trajectory} />
               </div>
             ))
           : stocks.map((stock, idx) => (
@@ -1212,7 +1246,91 @@ function ScoreExplain({ stock }: { stock?: EnrichedStock }) {
   )
 }
 
-function FundExplain({ stock, hideGm }: { stock?: FundStock; hideGm: boolean }) {
+// ===== 深历史组件 (Phase 3/4) =====
+
+/** ROE 近 5 年年报迷你条形 (正=上青色, 负=下红色) */
+function RoeMiniBars({ periods }: { periods: { period_end: string; roe?: number | null }[] }) {
+  const recent = periods.slice(-5)
+  const roes = recent.map(p => p.roe).filter((v): v is number => v != null)
+  if (!roes.length) return null
+  const maxAbs = Math.max(...roes.map(v => Math.abs(v)), 1)
+  return (
+    <div className="mt-1.5 flex items-end gap-1" title={recent.map(p => `${p.period_end.slice(0, 4)}: ${p.roe != null ? `${p.roe.toFixed(1)}%` : '—'}`).join('  ')}>
+      {recent.map((p, i) => {
+        const roe = p.roe
+        if (roe == null) return <div key={i} className="h-6 w-3 rounded-sm bg-elevated" />
+        const h = Math.max(8, Math.abs(roe) / maxAbs * 24)
+        return (
+          <div key={i} className="flex h-6 w-3 items-end justify-center">
+            {roe >= 0
+              ? <div className="w-3 rounded-sm bg-cyan-400/70" style={{ height: h }} />
+              : <div className="w-3 rounded-sm bg-bear/70" style={{ height: h }} />}
+          </div>
+        )
+      })}
+      <span className="ml-0.5 font-mono text-[9px] leading-3 text-muted">
+        近{recent.length}年<br />ROE
+      </span>
+    </div>
+  )
+}
+
+/** 市值份额轨迹 sparkline + 首尾值 (Phase 4) */
+function ShareSparkline({ row }: { row: McapTrajectoryRow }) {
+  const { shares, start_share, end_share, start, end } = row
+  if (shares.length < 2) return null
+  const min = Math.min(...shares), max = Math.max(...shares)
+  const span = max - min || 1
+  const w = 72, hgt = 16
+  const pts = shares.map((v, i) => `${(i / (shares.length - 1)) * w},${hgt - ((v - min) / span) * hgt}`).join(' ')
+  const rising = end_share > start_share
+  // 百分点差值, 与首尾份额同一语义 (相对增长率低基数会虚高, 如 3→7% 会显示 ↑133)
+  const deltaPp = (end_share - start_share) * 100
+  return (
+    <div className="mt-1.5 flex items-center gap-1.5" title={`行业内市值份额 ${start.slice(0, 7)} ${(start_share * 100).toFixed(1)}% → ${end.slice(0, 7)} ${(end_share * 100).toFixed(1)}% (${deltaPp >= 0 ? '+' : ''}${deltaPp.toFixed(1)}pp, 近5年, 历史价×当前股本近似)`}>
+      <svg width={w} height={hgt} className="shrink-0 overflow-visible">
+        <polyline points={pts} fill="none" stroke={rising ? 'rgb(34 211 238)' : 'rgb(244 63 94)'} strokeWidth="1.5" strokeLinejoin="round" />
+      </svg>
+      <span className={cn('font-mono text-[10px]', rising ? 'text-cyan-300' : 'text-bear')}>
+        {(start_share * 100).toFixed(1)}→{(end_share * 100).toFixed(1)}% {rising ? '↑' : '↓'}{Math.abs(deltaPp).toFixed(1)}pp
+      </span>
+    </div>
+  )
+}
+
+/** 三龙头卡片底部的深历史徽章区: ROE 序列 + 摘要 + 份额轨迹 */
+function DeepHistoryBadges({ symbol, history, trajectory }: {
+  symbol: string
+  history?: Record<string, FundamentalHistoryRow>
+  trajectory?: Record<string, McapTrajectoryRow>
+}) {
+  const h = history?.[symbol]
+  const t = trajectory?.[symbol]
+  return (
+    <>
+      <RoeMiniBars periods={h?.periods ?? []} />
+      {(() => {
+        const s = h?.summary
+        if (!s || !h?.has_deep) return null
+        return (
+          <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-muted">
+            {s.worst_roe != null && <span title={`近${s.years}年最差年 ROE(穿越周期能力)`}>最差ROE <span className={cn('font-mono', s.worst_roe < 8 ? 'text-amber-300' : 'text-foreground')}>{s.worst_roe.toFixed(1)}%</span></span>}
+            {s.revenue_cagr != null && <span title={`近${s.years}年营收年复合增速`}>CAGR <span className={cn('font-mono', s.revenue_cagr < 0 ? 'text-bear' : 'text-foreground')}>{s.revenue_cagr.toFixed(1)}%</span></span>}
+            {s.neg_growth_years != null && s.neg_growth_years > 0 && <span title={`近${s.years}年营收负增长年数`}>衰退 <span className="font-mono text-bear">{s.neg_growth_years}年</span></span>}
+          </div>
+        )
+      })()}
+      {t && <ShareSparkline row={t} />}
+      {h && !h.has_deep && h.periods.length > 0 && (
+        <div className="mt-1 text-[9px] leading-tight text-muted/70" title="深历史补数由后台每日 16:07 调度执行, 新候选当日生效">
+          深历史待补(现{h.periods.length}期)
+        </div>
+      )}
+    </>
+  )
+}
+
+function FundExplain({ stock, hideGm, history }: { stock?: FundStock; hideGm: boolean; history?: Record<string, FundamentalHistoryRow> }) {
   if (!stock) return <div className="rounded-xl border border-border/60 bg-surface p-4 text-sm text-muted">暂无基本面数据</div>
   const parts = stock.parts
   return (
@@ -1228,6 +1346,22 @@ function FundExplain({ stock, hideGm }: { stock?: FundStock; hideGm: boolean }) 
         <Part label={`营收份额 ${stock.revenueShare != null ? `${(stock.revenueShare * 100).toFixed(0)}%` : '—'}`} value={parts.revenue} cls="bg-purple-400" />
       </div>
       <div className="mt-2 text-[10px] text-muted">单期最新报告期初筛; 龙头结论宜结合多年财务验证</div>
+      {(() => {
+        const h = history?.[stock.symbol]
+        const s = h?.summary
+        if (!h?.has_deep || !s) return null
+        return (
+          <div className="mt-1.5 rounded-lg bg-base/40 px-2 py-1.5 text-[10px] leading-relaxed">
+            <div className="mb-0.5 text-[10px] font-medium text-foreground">深验证 · 近{s.years}年</div>
+            <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-muted">
+              {s.worst_roe != null && s.best_roe != null && <span>ROE区间 <span className="font-mono text-foreground">{s.worst_roe.toFixed(1)}~{s.best_roe.toFixed(1)}%</span></span>}
+              {!hideGm && s.gm_min != null && s.gm_max != null && <span>毛利率 <span className="font-mono text-foreground">{s.gm_min.toFixed(0)}~{s.gm_max.toFixed(0)}%</span></span>}
+              {s.revenue_cagr != null && <span>营收CAGR <span className={cn('font-mono', s.revenue_cagr < 0 ? 'text-bear' : 'text-foreground')}>{s.revenue_cagr.toFixed(1)}%</span></span>}
+              <span>负增长 <span className="font-mono text-foreground">{s.neg_growth_years ?? 0}/{s.years}年</span></span>
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }

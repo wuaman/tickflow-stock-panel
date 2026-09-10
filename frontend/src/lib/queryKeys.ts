@@ -49,6 +49,8 @@ export const QK = {
   screenerKlineBatch:   (symbols: string) => ['screener-kline-batch', symbols] as const,
   marketSnapshot:       ['market-snapshot'] as const,
   fundamentalSnapshot:  ['fundamental-snapshot'] as const,
+  fundamentalHistory:   (symbols: string) => ['fundamental-history', symbols] as const,
+  mcapTrajectory:       (symbols: string) => ['mcap-trajectory', symbols] as const,
   limitLadder:          (asOf?: string) => ['limit-ladder', asOf] as const,
 
   // Backtest

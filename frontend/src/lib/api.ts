@@ -414,6 +414,43 @@ export interface FundamentalRow {
   listing_date?: string | null
 }
 
+/** 年报单期 (深历史序列) */
+export interface FundamentalPeriod {
+  period_end: string
+  roe?: number | null
+  gross_margin?: number | null
+  revenue?: number | null
+  net_income_attributable?: number | null
+  revenue_yoy?: number | null
+}
+
+/** 近 5 年年报摘要 */
+export interface FundamentalSummary {
+  years: number
+  worst_roe?: number | null
+  best_roe?: number | null
+  gm_min?: number | null
+  gm_max?: number | null
+  revenue_cagr?: number | null
+  neg_growth_years?: number | null
+}
+
+export interface FundamentalHistoryRow {
+  has_deep: boolean
+  periods: FundamentalPeriod[]
+  summary?: FundamentalSummary | null
+}
+
+/** 近 5 年季度末行业内市值份额轨迹 (历史价×当前股本近似) */
+export interface McapTrajectoryRow {
+  start: string
+  start_share: number
+  end: string
+  end_share: number
+  dates: string[]
+  shares: number[]
+}
+
 export interface OverviewDimensionRankItem {
   name: string
   count: number
@@ -2510,6 +2547,12 @@ export const api = {
     request<{ as_of: string | null; rows: MarketSnapshotRow[] }>('/api/screener/market-snapshot'),
   fundamentalSnapshot: () =>
     request<{ as_of: string | null; rows: FundamentalRow[] }>('/api/screener/fundamental-snapshot'),
+  fundamentalHistory: (symbols: string[]) =>
+    request<{ rows: Record<string, FundamentalHistoryRow> }>(
+      `/api/screener/fundamental-history?symbols=${encodeURIComponent(symbols.join(','))}`),
+  mcapTrajectory: (symbols: string[]) =>
+    request<{ rows: Record<string, McapTrajectoryRow> }>(
+      `/api/screener/mcap-trajectory?symbols=${encodeURIComponent(symbols.join(','))}`),
   /** 基本面初筛 Top N → 更新候选清单(preferences, 不碰自选); 补数由每日 16:07 调度执行 */
   industryLeaderCandidates: (topN: number = 5) =>
     request<{

@@ -726,33 +726,33 @@ function ConceptFocus({ stat, onStockClick, activeSymbol }: { stat: ConceptStat 
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto">
-        <table className="min-w-full text-left text-xs">
-          <thead className="bg-elevated/60 text-[11px] text-muted">
+        <table className="min-w-full border-separate border-spacing-0 text-left text-xs">
+          <thead className="sticky top-0 z-10 bg-surface text-[11px] text-muted shadow-[0_1px_0_0_hsl(var(--border))]">
             <tr>
-              <th className="px-4 py-2 font-medium">排名</th>
-              <th className="px-4 py-2 font-medium">股票</th>
-              <th className="px-4 py-2 font-medium">涨跌幅</th>
-              <th className="px-4 py-2 font-medium">换手率</th>
-              <th className="px-4 py-2 font-medium">成交额</th>
-              <th className="px-4 py-2 font-medium">流通市值</th>
-              <th className="px-4 py-2 font-medium">量比</th>
-              <th className="px-4 py-2 font-medium">龙头分</th>
+              <th className="border-b border-border/50 px-4 py-2 font-medium">排名</th>
+              <th className="border-b border-border/50 px-4 py-2 font-medium">股票</th>
+              <th className="border-b border-border/50 px-4 py-2 font-medium">涨跌幅</th>
+              <th className="border-b border-border/50 px-4 py-2 font-medium">换手率</th>
+              <th className="border-b border-border/50 px-4 py-2 font-medium">成交额</th>
+              <th className="border-b border-border/50 px-4 py-2 font-medium">流通市值</th>
+              <th className="border-b border-border/50 px-4 py-2 font-medium">量比</th>
+              <th className="border-b border-border/50 px-4 py-2 font-medium">龙头分</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-border/70">
+          <tbody>
             {stocks.map((s, idx) => (
               <tr key={`${s.symbol}-${idx}`} className={cn('cursor-pointer', s.symbol === activeSymbol ? 'bg-accent/10 hover:bg-accent/15' : 'hover:bg-elevated/30')} onClick={() => onStockClick(s.symbol, s.name || undefined, focusNav)}>
-                <td className="px-4 py-2 font-mono text-muted">{idx + 1}</td>
-                <td className="px-4 py-2">
+                <td className="border-b border-border/50 px-4 py-2 font-mono text-muted">{idx + 1}</td>
+                <td className="border-b border-border/50 px-4 py-2">
                   <div className="font-medium text-foreground">{s.name || '—'}</div>
                   <div className="font-mono text-[10px] text-muted">{s.symbol}</div>
                 </td>
-                <td className={cn('px-4 py-2 font-mono tabular-nums', priceColorClass(s.change_pct))}>{s.change_pct != null ? fmtPct(s.change_pct) : '—'}</td>
-                <td className="px-4 py-2 font-mono text-foreground">{s.turnover_rate != null ? `${s.turnover_rate.toFixed(2)}%` : '—'}</td>
-                <td className="px-4 py-2 font-mono text-foreground">{fmtBigNum(s.amount)}</td>
-                <td className="px-4 py-2 font-mono text-foreground">{fmtBigNum(s.float_market_cap ?? s.market_cap)}</td>
-                <td className="px-4 py-2 font-mono text-foreground">{s.vol_ratio_5d != null ? s.vol_ratio_5d.toFixed(2) : '—'}</td>
-                <td className="px-4 py-2">
+                <td className={cn('border-b border-border/50 px-4 py-2 font-mono tabular-nums', priceColorClass(s.change_pct))}>{s.change_pct != null ? fmtPct(s.change_pct) : '—'}</td>
+                <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.turnover_rate != null ? `${s.turnover_rate.toFixed(2)}%` : '—'}</td>
+                <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{fmtBigNum(s.amount)}</td>
+                <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{fmtBigNum(s.float_market_cap ?? s.market_cap)}</td>
+                <td className="border-b border-border/50 px-4 py-2 font-mono text-foreground">{s.vol_ratio_5d != null ? s.vol_ratio_5d.toFixed(2) : '—'}</td>
+                <td className="border-b border-border/50 px-4 py-2">
                   <div className="flex items-center gap-2">
                     <span className="w-9 font-mono text-amber-300">{s.leaderScore.toFixed(0)}</span>
                     <div className="h-1.5 w-16 rounded-full bg-elevated"><div className="h-full rounded-full bg-amber-300" style={{ width: `${Math.max(4, s.leaderScore)}%` }} /></div>
