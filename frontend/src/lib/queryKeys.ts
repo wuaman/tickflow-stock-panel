@@ -51,6 +51,8 @@ export const QK = {
   extSeries:           (colsKey: string, date?: string | null, symbolsKey?: string) => ['ext-series', colsKey, date ?? '', symbolsKey ?? ''] as const,
   marketSnapshot:       ['market-snapshot'] as const,
   fundamentalSnapshot:  ['fundamental-snapshot'] as const,
+  fundamentalHistory:   (symbols: string) => ['fundamental-history', symbols] as const,
+  mcapTrajectory:       (symbols: string) => ['mcap-trajectory', symbols] as const,
   limitLadder:          (asOf?: string) => ['limit-ladder', asOf] as const,
 
   // Backtest
