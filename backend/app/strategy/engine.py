@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+from app.config import settings
 from app.strategy.scoring import (
     SCORING_DIRECTION_LOW,
     effective_scoring,
@@ -1119,8 +1121,15 @@ class StrategyEngine:
         overrides_map: dict | None = None,
         *,
         strategy_ids: list[str] | None = None,
+        parallel: bool = True,
     ) -> dict[str, StrategyResult]:
-        """批量执行策略；当前数据、历史和矩阵均来自同一个调用上下文。"""
+        """批量执行策略；当前数据、历史和矩阵均来自同一个调用上下文。
+
+        parallel=True 时用有界线程池并发执行: 策略对 context 是只读纯函数
+        (polars 计算释放 GIL), 并发不改变结果, 逐策略耗时日志不变。composite
+        子策略的递归 run_all 以 parallel=False 调用, 保证嵌套时线程总数仍
+        不超过 worker 上限, 不随叠加层数放大。
+        """
         if context.current is None:
             raise ValueError("strategy run_all context requires current data")
         df = context.current
@@ -1142,37 +1151,16 @@ class StrategyEngine:
             raise ValueError("selected strategies require history data")
 
         shared_matrix = context.market
-        matrix_strats = [
-            (sid, strategy)
-            for sid, strategy in selected
-            if strategy.execution_backend == "matrix_native"
-        ]
-        if (
-            shared_matrix is None
-            and matrix_strats
-            and shared_history is not None
-            and not shared_history.is_empty()
-        ):
-            from app.backtest.matrix import build_market_data_matrix
-
-            field_columns: set[str] = set()
-            for sid, strategy in matrix_strats:
-                field_columns.update(
-                    self._matrix_field_columns(
-                        strategy,
-                        overrides_map.get(sid),
-                        params_map.get(sid),
-                    )
-                )
-            shared_matrix = build_market_data_matrix(
-                shared_history,
-                field_columns=field_columns,
+        if shared_matrix is None:
+            shared_matrix = self.build_shared_matrix(
+                context, selected, params_map, overrides_map
             )
 
         results: dict[str, StrategyResult] = {}
 
-        for sid, _ in selected:
-            results[sid] = self.run(
+        def _execute(sid: str) -> tuple[str, StrategyResult]:
+            started = time.perf_counter()
+            result = self.run(
                 sid,
                 replace(
                     context,
@@ -1183,8 +1171,76 @@ class StrategyEngine:
                 params=params_map.get(sid),
                 overrides=overrides_map.get(sid),
             )
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            # >=1s 打 INFO 供热点归因 (哪些策略吃掉了 run_all 的大头), 其余 DEBUG 防噪。
+            log_fn = logger.info if elapsed_ms >= 1000 else logger.debug
+            log_fn(
+                "run_all: strategy %s took %.0fms (total=%d)",
+                sid,
+                elapsed_ms,
+                result.total,
+            )
+            return sid, result
+
+        workers = min(settings.strategy_run_all_workers, len(selected))
+        if parallel and workers > 1:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="strategy-run"
+            ) as pool:
+                futures = [pool.submit(_execute, sid) for sid, _ in selected]
+                # 按原顺序收集: 首个失败策略的异常语义与串行执行一致。
+                for future in futures:
+                    sid, result = future.result()
+                    results[sid] = result
+        else:
+            for sid, _ in selected:
+                sid, result = _execute(sid)
+                results[sid] = result
 
         return results
+
+    def build_shared_matrix(
+        self,
+        context: StrategyDataContext,
+        selected: list[tuple[str, StrategyDef]],
+        params_map: dict | None = None,
+        overrides_map: dict | None = None,
+    ):
+        """按所选策略的字段并集构建市场数据矩阵; 无矩阵策略或无历史时返回 None。
+
+        渐进式 run_all (逐策略执行) 也用它一次建好并集矩阵后放入 context.market,
+        避免每个 matrix_native 策略重复构建同一份大矩阵 (全市场历史, 秒级)。
+        """
+        params_map = params_map or {}
+        overrides_map = overrides_map or {}
+        matrix_strats = [
+            (sid, strategy)
+            for sid, strategy in selected
+            if strategy.execution_backend == "matrix_native"
+        ]
+        history = context.history
+        if not matrix_strats or history is None or history.is_empty():
+            return None
+
+        from app.backtest.matrix import build_market_data_matrix
+
+        field_columns: set[str] = set()
+        for sid, strategy in matrix_strats:
+            field_columns.update(
+                self._matrix_field_columns(
+                    strategy,
+                    overrides_map.get(sid),
+                    params_map.get(sid),
+                )
+            )
+        matrix_t0 = time.perf_counter()
+        matrix = build_market_data_matrix(history, field_columns=field_columns)
+        logger.info(
+            "run_all: shared matrix built in %.0fms (fields=%d)",
+            (time.perf_counter() - matrix_t0) * 1000,
+            len(field_columns),
+        )
+        return matrix
 
     @staticmethod
     def _matrix_field_columns(
@@ -1420,6 +1476,9 @@ class StrategyEngine:
             params_map={},
             overrides_map=overrides_map,
             strategy_ids=child_ids,
+            # 嵌套调用串行: 父级 worker 已并发, 子级再开池会使线程总数随叠加
+            # 层数放大 (4×4×...), 超出并发闸与核数的合理范围。
+            parallel=False,
         )
         ordered_results = [child_results[cid] for cid in child_ids]
 

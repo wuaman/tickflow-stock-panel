@@ -88,13 +88,12 @@ def get_realtime_quote_interval() -> float:
 
 
 def set_realtime_quote_interval(interval: float) -> float:
-    """保存行情轮询间隔（不在此做 min/max 校验，由调用方按档位限制）。"""
-    current = load()
-    current["realtime_quote_interval"] = interval
-    _path().write_text(
-        json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
-    _invalidate_cache()
+    """保存行情轮询间隔（不在此做 min/max 校验，由调用方按档位限制）。
+
+    走 save() 而不是自己 load + write_text: 锁外的 read-modify-write 会用旧快照
+    整体覆盖文件, 把并发写入的另一个偏好丢掉 (见 save 的 docstring)。
+    """
+    save({"realtime_quote_interval": interval})
     return interval
 
 
@@ -248,7 +247,7 @@ def get_data_source_long_job_timeout_s() -> int:
 
 
 def get_minute_batch_compress() -> bool:
-    """分时批量响应是否启用 gzip 传输压缩。默认开启 (公网部署传输是大头);
+    """分时详情与批量响应是否启用 gzip 传输压缩。默认开启 (公网部署传输是大头);
     本机/内网可关闭省服务端 CPU。每次请求即时读取, 开关保存后立即生效。
     """
     raw = load().get("minute_batch_compress", True)
@@ -256,7 +255,7 @@ def get_minute_batch_compress() -> bool:
 
 
 def get_daily_batch_compress() -> bool:
-    """日K批量响应是否启用 gzip 传输压缩 (与分时各自独立配置)。默认开启。"""
+    """日K详情与批量响应是否启用 gzip 传输压缩 (与分时各自独立配置)。默认开启。"""
     raw = load().get("daily_batch_compress", True)
     return bool(raw)
 
