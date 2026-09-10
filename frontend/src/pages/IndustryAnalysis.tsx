@@ -23,7 +23,7 @@ import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
 import { fmtBigNum, fmtPct, priceColorClass } from '@/lib/format'
 import { cn } from '@/lib/cn'
-import { resolveDimension, type DimensionGroup, type StockRow } from '@/lib/analysis-adapter'
+import { resolveDimension, MAX_DAILY_PCT, type DimensionGroup, type StockRow } from '@/lib/analysis-adapter'
 import { SectorRotationCard } from '@/components/SectorRotationCard'
 
 const KEYWORDS = ['industry', '行业', 'sector', '申万', '中信']
@@ -328,7 +328,7 @@ function calcIndustryStat(group: DimensionGroup, marketMap: Map<string, MarketSn
       return true
     })
 
-  const pctValues = stocks.map(s => num(s.change_pct)).filter((v): v is number => v != null)
+  const pctValues = stocks.map(s => num(s.change_pct)).filter((v): v is number => v != null && Math.abs(v) <= MAX_DAILY_PCT)
   const turnoverValues = stocks.map(s => num(s.turnover_rate)).filter((v): v is number => v != null)
   const volValues = stocks.map(s => num(s.vol_ratio_5d)).filter((v): v is number => v != null)
   const totalAmount = stocks.reduce((sum, s) => sum + (num(s.amount) ?? 0), 0)
