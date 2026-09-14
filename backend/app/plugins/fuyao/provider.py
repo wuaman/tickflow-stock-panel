@@ -69,6 +69,14 @@ _STATEMENT_ENDPOINTS = {
 _ADJ_DUMP_KIND = "adjustment-factors"
 _DAILY10_DUMP_KIND = "daily-k-10d"
 _DAILY_DUMP_KIND = "daily-k"  # 10 年全量日K dump(约 172MB), 深窗口一次下载覆盖全市场
+# 需要追新 release 的小体量 dump → 路径 memo 带 TTL(秒), 过期重查最新 release。
+# 不在此表的大 dump(172MB)维持"落盘即 memo": 中段历史不变, 尾部新鲜度由 10d
+# dump 兜底, 追新只会日日重下整文件。无 TTL 时长驻进程会把首启日的 10d dump
+# 用到进程重启为止, 近端窗口全部落空 (2026-09-14 修复任务死循环的直接成因)。
+_DUMP_PATH_TTL_S: dict[str, float] = {
+    _DAILY10_DUMP_KIND: 30 * 60,
+    _ADJ_DUMP_KIND: 30 * 60,
+}
 _RECENT_DUMP_DAYS = 12  # 窗口跨度 ≤ 此天数时优先走 10d dump(覆盖 ≈10 个交易日)
 _PREV_CLOSE_BACKDAYS = 30  # 推导因子时向前找"除权日前收盘"的回看天数(容忍长期停牌)
 _DAILY_DUMP_BATCH_ROWS = 100_000
@@ -230,10 +238,22 @@ def _kline_rows(symbol: str, bars: list[dict]) -> list[dict]:
 
 
 def _tail_ok(end_d: date, covered_max: date) -> bool:
-    """请求终点是否被覆盖到 covered_max: 周末/节假日的自然缺口(≤3 天)不算缺失。"""
+    """请求终点是否被覆盖到 covered_max: 周末/节假日的自然缺口不算缺失。
+
+    缺口内出现工作日即未覆盖。此前只查"≤3 天且终点为周末": 周四数据的 dump
+    配上周六终点会把中间的周五交易日当已覆盖, 近端窗口拉取从 dump 过滤出 0 行
+    还自认成功 → 完整性修复任务空转, 门禁反复重建任务形成死循环 (2026-09-14)。
+    """
     if end_d <= covered_max:
         return True
-    return (end_d - covered_max).days <= 3 and end_d.weekday() >= 5
+    if end_d.weekday() < 5:
+        return False
+    d = covered_max + timedelta(days=1)
+    while d < end_d:  # end_d 本身已是周末
+        if d.weekday() < 5:
+            return False
+        d += timedelta(days=1)
+    return True
 
 
 def _dump_covers(dump: pl.DataFrame, start_d: date, end_d: date) -> bool:
@@ -313,7 +333,9 @@ class FuyaoProvider:
         self.config = _FuyaoConfig()
         self._client: FuyaoClient | None = None
         self._dump_memo: dict[str, pl.DataFrame] = {}
+        self._dump_memo_path: dict[str, Path] = {}
         self._dump_path_memo: dict[str, Path] = {}
+        self._dump_path_ts: dict[str, float] = {}
 
     def close(self) -> None:  # loader.load_all 重建注册表时会对每个 provider 调 close
         if self._client is not None:
@@ -321,7 +343,9 @@ class FuyaoProvider:
                 self._client.close()
             self._client = None
         self._dump_memo.clear()
+        self._dump_memo_path.clear()
         self._dump_path_memo.clear()
+        self._dump_path_ts.clear()
 
     def _get_client(self) -> FuyaoClient:
         if self._client is None:
@@ -333,12 +357,29 @@ class FuyaoProvider:
         """确保最新 release 的 dump 已落盘, 返回缓存路径(大文件不整读进内存)。
 
         release 号取自预签名 URL 的 releases/<date>/ 路径; 新 release 落盘后清理旧版缓存。
+        路径 memo 按 kind 带 TTL (见 _DUMP_PATH_TTL_S): 表内 kind 过期重查最新
+        release, 表外 kind 落盘即 memo 永不重查。重查失败但有本地缓存时降级复用,
+        上游抖动不放大为取数失败。
         """
+        ttl = _DUMP_PATH_TTL_S.get(dump_kind, float("inf"))
         memo = self._dump_path_memo.get(dump_kind)
-        if memo is not None and memo.exists():
+        now = time.time()
+        if (
+            memo is not None
+            and memo.exists()
+            and now - self._dump_path_ts.get(dump_kind, 0.0) < ttl
+        ):
             return memo
         client = self._get_client()
-        info = client.dump_download_url(dump_kind)
+        try:
+            info = client.dump_download_url(dump_kind)
+        except FuyaoError as e:
+            if memo is not None and memo.exists():
+                logger.warning("扶摇 dump %s 最新 release 查询失败, 复用本地缓存 %s: %s",
+                               dump_kind, memo.name, e)
+                self._dump_path_ts[dump_kind] = now  # 失败也重置 TTL, 不反复打接口
+                return memo
+            raise
         release = _release_of(str(info.get("presigned_url") or ""))
         dest = _cache_dir() / f"{cache_prefix}__{release}.parquet"
         if not dest.exists():
@@ -348,15 +389,26 @@ class FuyaoProvider:
                     old.unlink(missing_ok=True)
             logger.info("扶摇 dump %s(release %s)已下载: %s", dump_kind, release, dest.name)
         self._dump_path_memo[dump_kind] = dest
+        self._dump_path_ts[dump_kind] = now
         return dest
 
     def _ensure_dump(self, dump_kind: str, cache_prefix: str) -> pl.DataFrame:
-        """小体量 dump(快照 10d / 因子)整读 + 进程内 memo, 避免重复打接口/读盘。"""
+        """小体量 dump(快照 10d / 因子)整读 + 进程内 memo, 避免重复打接口/读盘。
+
+        memo 跟随路径: TTL 刷新拉到新 release 后旧 DataFrame 失效, 不会继续用旧数据。
+        (测试直注 _dump_memo 不设路径 → 无路径绑定, 无条件信任。)
+        """
         memo = self._dump_memo.get(dump_kind)
-        if memo is not None:
+        if memo is not None and self._dump_memo_path.get(dump_kind) is None:
             return memo
-        df = pl.read_parquet(self._ensure_dump_path(dump_kind, cache_prefix))
+        path = self._ensure_dump_path(dump_kind, cache_prefix)
+        if self._dump_memo_path.get(dump_kind) == path:
+            memo = self._dump_memo.get(dump_kind)
+            if memo is not None:
+                return memo
+        df = pl.read_parquet(path)
         self._dump_memo[dump_kind] = df
+        self._dump_memo_path[dump_kind] = path
         return df
 
     def _ensure_daily_big_dump(self, start_d: date) -> Path | None:
