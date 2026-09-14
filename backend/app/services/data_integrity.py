@@ -343,6 +343,21 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
             result = run_with_capacity(job_id, _run)
             if isinstance(result, dict) and "error" in result:
                 job_store.fail(job_id, str(result["error"]))
+                return
+            # 修复后复扫: 仍检出坏分区 → 任务判失败。曾出现修复管道从数据源拿到
+            # 0 行仍报成功 (fuyao 旧 10d dump 被误判覆盖窗口), 门禁重扫→再建新
+            # 任务→再空转, 用户端表现为修复任务无限循环。失败信息直接可见。
+            try:
+                remaining = scan_recent_integrity(repo.store.data_dir)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("integrity repair post-check scan failed: %s", e)
+                remaining = []
+            if remaining:
+                job_store.fail(
+                    job_id,
+                    f"修复后仍检测到{describe_issues(remaining)}, 数据源未返回该区间数据, "
+                    "请在「数据」页手动执行数据修正",
+                )
             else:
                 job_store.succeed(job_id, result)
         except JobCancelledError:
