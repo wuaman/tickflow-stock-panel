@@ -837,6 +837,111 @@ def test_daily_dump_weekend_end_covered(monkeypatch):
     assert not df.is_empty()
 
 
+def test_tail_ok_rejects_weekday_inside_gap():
+    """回归 (2026-09-14): 缺口内含工作日不得视为已覆盖。
+
+    旧逻辑只查"≤3 天且终点为周末": 周四末端的 dump 配上周六终点会把中间的
+    周五交易日当已覆盖, 完整性修复从旧 dump 过滤 0 行仍报成功 → 死循环。
+    """
+    # 周四末端 → 周六终点, 中间隔周五交易日 → 未覆盖
+    assert not fp._tail_ok(date(2026, 9, 13), date(2026, 9, 10))
+    # 周五末端 → 周日终点, 缺口仅周末 → 覆盖
+    assert fp._tail_ok(date(2026, 9, 13), date(2026, 9, 11))
+    # 终点为工作日且超出末端 → 未覆盖
+    assert not fp._tail_ok(date(2026, 9, 11), date(2026, 9, 10))
+    # 终点被末端覆盖 → 覆盖
+    assert fp._tail_ok(date(2026, 9, 10), date(2026, 9, 11))
+
+
+def test_stale_dump_with_weekend_end_falls_back_to_api(monkeypatch):
+    """回归 (2026-09-14): dump 止于周四、窗口 [周五~周日] 必须回退单标的接口。
+
+    旧逻辑把该窗口判成"周末自然缺口已覆盖", 从 dump 过滤出 0 行静默返回,
+    修复任务空转。修复后回退接口拿到真实的周五数据。
+    """
+    bars = {"000001.SZ": [_bar(date(2026, 9, 11), 11.05)]}
+    provider = _hist_provider(monkeypatch, _FakeHistClient(bars))
+    provider._dump_memo[fp._DAILY10_DUMP_KIND] = _daily10_dump(
+        [_dump_bar("000001.SZ", date(2026, 9, 10), 11.0)]  # dump 止于周四
+    )
+    df = provider.get_daily(["000001.SZ"], datetime(2026, 9, 11), datetime(2026, 9, 13))
+    assert provider._get_client().calls  # 回退单标的接口
+    assert df["date"].to_list() == [date(2026, 9, 11)]
+
+
+def test_dump_path_memo_ttl_refreshes_and_invalidates_df_memo(monkeypatch, tmp_path):
+    """路径 memo 带 TTL: 过期重查最新 release; 新 release 落盘后旧 df memo 一并失效。
+
+    回归 (2026-09-14): 长驻进程把首启日下载的 10d dump memo 到重启为止,
+    近端窗口全部从过期数据过滤, 且无任何告警。
+    """
+    monkeypatch.setattr(fp, "_cache_dir", lambda: tmp_path)
+
+    class _FakeDumpClient:
+        def __init__(self):
+            self.queries = 0
+
+        def dump_download_url(self, dump_kind):
+            self.queries += 1
+            release = "20260910" if self.queries == 1 else "20260913"
+            return {"presigned_url": f"https://o/releases/{release}/dump.parquet"}
+
+        def download_dump(self, dump_kind, dest):
+            d = date(2026, 9, 10) if "20260910" in dest.name else date(2026, 9, 13)
+            _daily10_dump([_dump_bar("000001.SZ", d, 11.0)]).write_parquet(dest)
+
+        def close(self):
+            pass
+
+    fake = _FakeDumpClient()
+    provider = FuyaoProvider()
+    monkeypatch.setattr(fp, "fuyao_client", type("M", (), {"FuyaoClient": lambda **kw: fake}))
+    monkeypatch.setattr(fp, "get_api_key", lambda: "test-key")
+
+    df1 = provider._ensure_dump(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+    assert (tmp_path / "daily_k_10d__20260910.parquet").exists()
+    # TTL 内 memo 命中, 不重查 release
+    provider._ensure_dump(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+    assert fake.queries == 1
+    # TTL 过期 (ts 归零模拟时间流逝) → 重查拿到新 release, 旧缓存清理, df memo 换新
+    provider._dump_path_ts[fp._DAILY10_DUMP_KIND] = 0.0
+    df2 = provider._ensure_dump(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+    assert fake.queries == 2
+    assert (tmp_path / "daily_k_10d__20260913.parquet").exists()
+    assert not (tmp_path / "daily_k_10d__20260910.parquet").exists()
+    assert df2["date_ms"][0] != df1["date_ms"][0]
+
+
+def test_dump_path_memo_query_failure_reuses_stale_cache(monkeypatch, tmp_path):
+    """TTL 过期后重查失败: 有本地缓存则降级复用, 上游抖动不放大为取数失败。"""
+    monkeypatch.setattr(fp, "_cache_dir", lambda: tmp_path)
+
+    class _FlakyDumpClient:
+        def __init__(self):
+            self.failed = False
+
+        def dump_download_url(self, dump_kind):
+            if self.failed:
+                raise fc.FuyaoError("网络请求失败: connection reset")
+            return {"presigned_url": "https://o/releases/20260910/dump.parquet"}
+
+        def download_dump(self, dump_kind, dest):
+            _daily10_dump([_dump_bar("000001.SZ", date(2026, 9, 10), 11.0)]).write_parquet(dest)
+
+        def close(self):
+            pass
+
+    fake = _FlakyDumpClient()
+    provider = FuyaoProvider()
+    monkeypatch.setattr(fp, "fuyao_client", type("M", (), {"FuyaoClient": lambda **kw: fake}))
+    monkeypatch.setattr(fp, "get_api_key", lambda: "test-key")
+
+    path1 = provider._ensure_dump_path(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+    provider._dump_path_ts[fp._DAILY10_DUMP_KIND] = 0.0  # TTL 过期
+    fake.failed = True
+    assert provider._ensure_dump_path(fp._DAILY10_DUMP_KIND, "daily_k_10d") == path1
+
+
 def test_daily_dump_rejects_non_raw_adjustment(monkeypatch):
     """防御: dump 变为复权口径(adjusted != none)时拒绝输出, 不污染原始K线库。"""
     dump = _recent_daily_dump().with_columns(pl.lit("forward").alias("adjusted"))
