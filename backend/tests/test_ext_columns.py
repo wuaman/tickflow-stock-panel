@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from app.api import screener, watchlist
 from app.services.ext_data import ExtConfig, ExtConfigStore, ExtField, PullConfig
 from app.services.screener import ScreenerService
+from app.tickflow.capabilities import Cap, CapabilitySet
 
 _DAY = date(2026, 11, 5)
 _FIELD = "ext_gn_ths.所属概念"
@@ -96,6 +97,12 @@ def client(tmp_path, monkeypatch):
     app.state.depth_service = SimpleNamespace(
         get_sealed_map=lambda *args, **kwargs: {}, is_sealed_ready=lambda _: False,
     )
+    # 二开: watchlist 端点 _has_financial 权限门禁读 app.state.capabilities,
+    # 缺了会 AttributeError 500 (本文件 5 个 watchlist 用例全红)。授 FINANCIAL 后
+    # tmp_path 下无 financials/metrics → get_financial_df 空 → 不 JOIN, 不影响断言。
+    caps = CapabilitySet()
+    caps.grant(Cap.FINANCIAL)
+    app.state.capabilities = caps
     app.include_router(screener.router)
     app.include_router(watchlist.router)
     with TestClient(app, raise_server_exceptions=False) as test_client:
