@@ -212,20 +212,58 @@ def test_daily_limit_prices_require_matching_instrument_date(instrument_as_of, e
     instrument_data = {
         "symbol": ["600001.SH"],
         "name": ["普通股"],
-        "limit_up": [10.90],
-        "limit_down": [9.10],
+        # 权威价与理论价 (昨收 10.00 x 0.9 = 9.00) 差 2 分, 落在 _AUTH_LIMIT_TOL_ABS
+        # (2 分) 容差内 → 视为同档位的分档取整误差, 权威价被采信。
+        # 偏差超容差的情形是「维表滞后」, 由 test_stale_instrument_limit_price_falls_back
+        # _to_theoretical 单独覆盖。
+        "limit_up": [10.98],
+        "limit_down": [9.02],
     }
     if instrument_as_of is not None:
         instrument_data["as_of"] = [instrument_as_of]
 
     result = pipeline.compute_limit_signals(
-        _daily_limit_rows(9.10),
+        _daily_limit_rows(9.02),
         pl.DataFrame(instrument_data),
         needed={"signal_limit_down"},
     )
 
     assert result["signal_limit_down"][-1] is expected
     assert "_instrument_as_of" not in result.columns
+
+
+def test_stale_instrument_limit_price_falls_back_to_theoretical():
+    """维表日期匹配但权威价与理论价偏差超容差 = 维表滞后 → 回退理论价重算。
+
+    场景 (2026-09-07 实测): 盘前 09:10 同步的维表 limit_up/limit_down 还是上一
+    交易日的价, 而 as_of 已盖当日。昨收 11.00 时维表给出 12.10/9.90; 次日昨收
+    10.00 (理论 11.00/9.00), 维表若未滚动仍带 9.90 —— 收盘 9.90 会被 stale 权威价
+    判成跌停 (实际 9.90 > 9.00 不是跌停), 同时真涨停 11.00 被 12.10 挡掉漏判。
+    """
+    stale = pl.DataFrame({
+        "symbol": ["600001.SH"],
+        "name": ["普通股"],
+        "limit_up": [12.10],       # 按上一日昨收 11.00 算的, 已滞后
+        "limit_down": [9.90],
+        "as_of": [date(2026, 7, 20)],   # 日期与行情一致, 但价是旧的
+    })
+
+    # 收盘 9.90: 偏离理论跌停 9.00 达 10%, 不得被 stale 权威价判成跌停
+    stale_down = pipeline.compute_limit_signals(
+        _daily_limit_rows(9.90),
+        stale,
+        needed={"signal_limit_down"},
+    )
+    assert stale_down["signal_limit_down"][-1] is False
+
+    # 收盘 11.00 = 10.00 x 1.1 真涨停: 不得被 stale 权威价 12.10 挡掉
+    sealed = pipeline.compute_limit_signals(
+        _daily_limit_rows(11.00),
+        stale,
+        needed={"signal_limit_up", "consecutive_limit_ups"},
+    )
+    assert sealed["signal_limit_up"][-1] is True
+    assert sealed["consecutive_limit_ups"][-1] == 1
 
 
 def test_daily_limit_prices_ignore_zero_placeholder_and_match_realtime():
