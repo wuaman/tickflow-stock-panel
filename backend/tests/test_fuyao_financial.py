@@ -1,7 +1,7 @@
 """fuyao 财务适配测试 (不依赖真实网络)。
 
 覆盖: 三大报表字段映射 (canonical 列名 + 扩展列透传 + ISO 日期口径)、
-latest_only 分档 (limit 1 vs 8)、metrics 组装 (eps_basic 顺带 / bps 估值反推 /
+latest_only 分档 (limit 1 vs 20 期, 全量走 quarterly+annual 双维度)、metrics 组装 (eps_basic 顺带 / bps 估值反推 /
 指标 index_id 映射与未知 id 透传 / 单股指标失败不弃行)、shares 恒空、
 报告期合并写入的逐列填空语义 (并集共存, 新行缺列不覆盖旧值)。
 """
@@ -34,10 +34,14 @@ class _FakeFinClient:
         self.valuations = valuations or []
         self.prices = prices or []
         self.stmt_calls: list[tuple] = []
+        self.stmt_periods: list[str | None] = []
         self.ind_calls: list[str] = []
 
-    def financial_statements(self, stmt, thscode, limit=1):
+    def financial_statements(self, stmt, thscode, limit=1, period=None):
+        # period: None = 仅最新 1 期; "quarterly"/"annual" = 全量历史双维度。
+        # 本假客户端对任何维度都返回同一份预置行 (不模拟两维度数据差异)。
         self.stmt_calls.append((stmt, thscode, limit))
+        self.stmt_periods.append(period)
         return [dict(r, thscode=thscode) for r in self.statements.get(stmt, [])]
 
     def financial_indicators(self, thscode, report):
@@ -104,8 +108,12 @@ def test_statements_limit_latest_vs_history(monkeypatch):
     provider = _provider_with(monkeypatch, fake)
     provider.get_financials("income", ["600519.SH"], latest_only=True)
     assert fake.stmt_calls == [("income", "600519.SH", 1)]
+    assert fake.stmt_periods == [None]  # 最新 1 期不带维度, 按接口默认口径
     provider.get_financials("income", ["600519.SH"], latest_only=False)
     assert fake.stmt_calls[-1] == ("income", "600519.SH", fp._FINANCIAL_HISTORY_PERIODS)
+    # 全量历史 = quarterly + annual 双维度各拉一次 (季度约 5 年 + 年报约 20 年,
+    # 年末报告期两口径同值, 由 _merge_report_history 去重)
+    assert fake.stmt_periods[-2:] == ["quarterly", "annual"]
 
 
 def test_balance_and_cashflow_mapping(monkeypatch):
