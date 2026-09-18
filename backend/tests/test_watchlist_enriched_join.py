@@ -9,11 +9,17 @@ universe 里的自选股静默丢弃.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import polars as pl
 
 from app.api import watchlist as wl_api
+from app.services import financial_sync as fs
+from app.tickflow.capabilities import Cap, CapabilitySet
+
+# 不存在的财务目录: 让端点走「无财务数据」分支
+_NO_DATA_DIR = Path("/nonexistent-tickflow-test-data")
 
 
 class _FakeRepo:
@@ -21,7 +27,7 @@ class _FakeRepo:
 
     def __init__(self, enriched_df, enriched_date, etf_df=None, etf_date=None,
                  instruments_df=None, name_map=None, etf_set=None,
-                 index_df=None, index_date=None, index_set=None):
+                 index_df=None, index_date=None, index_set=None, data_dir=None):
         self._enriched = enriched_df
         self._enriched_date = enriched_date
         self._etf = etf_df
@@ -32,6 +38,10 @@ class _FakeRepo:
         self._name_map = name_map or {}
         self._etf_set = etf_set or set()
         self._index_set = index_set or set()
+        # 端点取财务列时读 repo.store.data_dir; 默认指向不存在的目录 →
+        # get_financial_df 返回空 → 不 JOIN 财务列 (本文件既有断言的口径)。
+        # 要覆盖财务列 JOIN 就传一个含 financials/metrics/part.parquet 的临时目录。
+        self.store = SimpleNamespace(data_dir=data_dir or _NO_DATA_DIR)
 
     def get_enriched_latest(self):
         return self._enriched, self._enriched_date
@@ -58,8 +68,18 @@ class _FakeRepo:
         return {s: n for s, n in self._name_map.items() if s in (symbols or [])}
 
 
-def _make_request(repo):
-    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(repo=repo)))
+def _make_request(repo, *, financial: bool = True):
+    """最小化 Request mock。
+
+    端点会读 request.app.state.capabilities 做财务列权限判定 (_has_financial),
+    默认授 FINANCIAL, 避免落到 _financial_is_custom() 读全局配置而结果不确定。
+    """
+    caps = CapabilitySet()
+    if financial:
+        caps.grant(Cap.FINANCIAL)
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(repo=repo, capabilities=caps))
+    )
 
 
 def _enriched_df(symbols_data):
@@ -349,3 +369,71 @@ def test_watchlist_enriched_limit_prices_legacy_st(monkeypatch):
     assert rows["600029.SH"]["limit_up_price"] == 10.5
     assert rows["600029.SH"]["limit_down_price"] == 9.5
     assert rows["600519.SH"]["limit_up_price"] == 1980.0
+
+
+def _write_metrics(data_dir, rows):
+    """写一份 metrics 财务表: rows = [(symbol, period_end, roe, eps_basic), ...]"""
+    path = data_dir / "financials" / "metrics"
+    path.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        [
+            {"symbol": s, "period_end": pe, "roe": roe, "gross_margin": 89.0,
+             "eps_basic": eps, "debt_to_asset_ratio": 21.0}
+            for s, pe, roe, eps in rows
+        ]
+    ).write_parquet(path / "part.parquet")
+
+
+def test_watchlist_enriched_joins_financial_columns_when_capable(monkeypatch, tmp_path):
+    """有 FINANCIAL 能力时按最新报告期 LEFT JOIN 财务列。
+
+    比率字段 (roe/gross_margin/debt_ratio) 存的是百分点, 端点 ÷100 转小数与
+    enriched 其它比率列同口径; eps/bps 是每股金额, 不除。
+    """
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: [{"symbol": "600519.SH"}, {"symbol": "000001.SZ"}])
+    _write_metrics(tmp_path, [
+        ("600519.SH", "2026-03-31", 12.0, 20.0),
+        ("600519.SH", "2026-06-30", 16.75, 35.57),   # 更新期必须胜出
+        # 000001.SZ 无财务数据 → 财务列为 null
+    ])
+    repo = _FakeRepo(
+        enriched_df=_quote_df([("600519.SH", 1900.0, 1800.0, 1.0, 1.0, 1.0, 1.0),
+                               ("000001.SZ", 11.0, 10.0, 1.0, 1.0, 1.0, 1.0)]),
+        enriched_date="2026-07-08",
+        name_map={"600519.SH": "贵州茅台", "000001.SZ": "平安银行"},
+        data_dir=tmp_path,
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    rows = {r["symbol"]: r for r in res["rows"]}
+
+    assert rows["600519.SH"]["roe"] == 16.75 / 100      # 取 2026-06-30 那期
+    assert rows["600519.SH"]["gross_margin"] == 0.89    # 百分点 → 小数
+    assert rows["600519.SH"]["debt_ratio"] == 0.21
+    assert rows["600519.SH"]["eps"] == 35.57            # 每股金额不除
+    # 无财务数据的自选股仍返回该行, 财务列为 null (不因 JOIN 丢行)
+    assert rows["000001.SZ"]["eps"] is None
+    assert rows["000001.SZ"]["close"] == 11.0
+
+
+def test_watchlist_enriched_omits_financial_columns_without_capability(monkeypatch, tmp_path):
+    """无 FINANCIAL 能力且财务源非 custom 时: 不 JOIN → 财务列不在结果里。
+
+    这是二开加的能力门禁: 未订阅 TickFlow 财务套餐的用户不该看到财务列。
+    """
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols", lambda: [{"symbol": "600519.SH"}])
+    monkeypatch.setattr(fs, "_financial_is_custom", lambda: False)
+    _write_metrics(tmp_path, [("600519.SH", "2026-06-30", 16.75, 35.57)])
+    repo = _FakeRepo(
+        enriched_df=_quote_df([("600519.SH", 1900.0, 1800.0, 1.0, 1.0, 1.0, 1.0)]),
+        enriched_date="2026-07-08",
+        name_map={"600519.SH": "贵州茅台"},
+        data_dir=tmp_path,   # 数据在, 但无权限 → 仍不 JOIN
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo, financial=False), ext_columns=None)
+    row = res["rows"][0]
+
+    assert "roe" not in row and "eps" not in row
+    assert row["close"] == 1900.0   # 行情列不受影响
