@@ -142,8 +142,15 @@ if fr:
     L.append('')
 
 cf = d.get('conflicts') or []
-if cf:
-    L.append('## 冲突文件（%d 处）' % len(cf))
+cd = d.get('conflicts_detail') or []
+if cd:
+    # 冲突逐条细节刻意不进飞书(消息要短), 只在这里留 —— 这是事后复核的唯一依据
+    L.append('## 冲突怎么解的（%s 处；飞书里只报计数）' % (len(cf) or len(cd)))
+    L.append('')
+    for x in cd: L.append('- %s' % x)
+    L.append('')
+elif cf:
+    L.append('## 冲突文件（%d 处，未记录解决方式）' % len(cf))
     L.append('')
     for x in cf: L.append('- `%s`' % x)
     L.append('')
