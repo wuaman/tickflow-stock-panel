@@ -20,7 +20,7 @@ run.sh (cron)
 | `deploy.sh` 只部署带 `sync/<日期>` 标签的提交 | HEAD 与标签不一致直接拒绝 —— 未验证的树进不了线上 |
 | 对账三关 | 二开提交标题逐条对账 + 文件范围对账，防"冲突解错悄悄丢上游代码" |
 | 失败自动回退 | 健康检查不过就把镜像和数据都退回上一版，并告警 |
-| 权限清单 `settings-sync-loop.json` | 无人值守只放行 `git`/`docker`/本目录脚本，防上游内容夹带指令；配合 `--permission-prompts none`，清单外的操作直接拒绝而不是挂起等超时 |
+| 权限清单 `settings-sync-loop.json` | 无人值守时工具放行清单；配合 `--permission-prompts none`，清单外的操作**直接拒绝**而不是挂起等超时 |
 
 ## 文件
 
@@ -151,5 +151,6 @@ SYNC_LOOP_STOP_BEFORE_DEPLOY=1 bash scripts/upstream-sync/run.sh
 | 路径变成 `/v1/v1/messages` | `ANTHROPIC_BASE_URL` 多带了 `/v1` 后缀，去掉 |
 | cron 跑了但什么都没发生 | 上游没更新（正常，看 `.sync-loop/logs/`）；或 CLI 未登录 |
 | 收到"未正常结束"告警 | agent 被权限拦停/超时，看日志尾部；线上未被改动即代表安全 |
+| agent 说"命令被拒绝" | 权限判断按**整条命令的首个程序**匹配：`echo "==="; git diff` 这种复合命令会被整条拒（里面的 git 在白名单也没用）。现状是放行整个 Bash 工具，若你收紧了清单请记住这条 |
 | 东财源 Connection refused | shim 没跟 app 一起重启 —— `docker restart TickFlow_FinancialShim` |
 | 上游 force push 重写历史 | gate 会报 `rewritten=true`，skill 改用 `git rebase --onto` 重演 |
