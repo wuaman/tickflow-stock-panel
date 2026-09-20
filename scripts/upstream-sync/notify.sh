@@ -53,9 +53,13 @@ TITLE="$TITLE" LEVEL="$LEVEL" BODY="$BODY" WEBHOOK="$WEBHOOK" SECRET="${SECRET:-
 import base64, hashlib, hmac, json, os, sys, time, urllib.request
 
 title, level = os.environ["TITLE"], os.environ["LEVEL"]
-body = os.environ["BODY"][:4500]           # 飞书单元素有长度上限, 超了整条会发不出去
 webhook, secret = os.environ["WEBHOOK"], os.environ["SECRET"]
 template = {"ok": "green", "warn": "orange", "fail": "red"}.get(level, "blue")
+
+LIMIT = 4500                      # 飞书单元素有长度上限, 超了整条会发不出去
+body = os.environ["BODY"]
+if len(body) > LIMIT:             # 静默截断会让人以为"报告就这些", 所以留个明确标记
+    body = body[: LIMIT - 40] + "\n\n…(报告过长, 已截断)"
 
 payload = {
     "msg_type": "interactive",
