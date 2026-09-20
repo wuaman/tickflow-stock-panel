@@ -110,3 +110,6 @@ TickFlowStockPanel.app/
 TickFlowStockPanel-macos*.dmg
 TickFlowStockPanel-macos*.zip
 reports/cursor_tickflow_pro_rate_limit_p0.bundle
+
+# 上游同步 loop 的状态与日志 (二开工具)
+.sync-loop/
