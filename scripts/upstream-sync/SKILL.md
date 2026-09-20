@@ -9,7 +9,7 @@ description: 检查上游 shy3130/tickflow-stock-panel 是否有更新; 有则�
 
 ## 硬约束(违反其中任何一条都算这次运行失败)
 
-1. **绝不直接在 `main` 上 rebase**。全部工作在 `sync/<VER>` 分支上做, 只有部署成功才把 `main` 指过去。失败就丢掉分支, `main` 和线上都不受影响。
+1. **绝不直接在 `main` 上 rebase**。全部工作在 `syncing/<VER>` 分支上做, 只有部署成功才把 `main` 指过去。失败就丢掉分支, `main` 和线上都不受影响。
 2. **不用 `git merge origin/main`**。上游会 force push 重写历史(2026-09-20 就发生过一次: `merge-base` 直接为空), merge 会把几百个重复提交搅进历史。
 3. **部署只走 `scripts/upstream-sync/deploy.sh`**, 它带安全不变量: 只允许部署带 `sync/<VER>` 标签的提交, HEAD 与标签不一致直接拒绝。
 4. **对账没全过就不部署**。宁可这次不同步、发一条"人工介入"通知, 也不要上一个可能丢了上游改动的版本。
@@ -21,7 +21,11 @@ description: 检查上游 shy3130/tickflow-stock-panel 是否有更新; 有则�
 
 ## 0. 起点与命名
 
-- `VER` = 当天日期 `YYYYMMDD`, 工作分支与标签都用 `sync/<VER>`。
+- `VER` = 当天日期 `YYYYMMDD`。
+- **工作分支用 `syncing/<VER>`, 发布标签用 `sync/<VER>` —— 两者刻意不同名**。同名会让 git 引用产生歧义
+  (解析顺序里 tags 优先于 heads), `git rev-parse sync/<VER>` 会静默解析成标签而不是分支。
+- **本机 git 是 2.17**, 没有 `git switch` / `git restore`, `cherry-pick -q` 也不支持 —— 一律用
+  `git checkout`; 需要引用标签时写全 `refs/tags/sync/<VER>`。
 - 先读闸门产物 `.sync-loop/gate.env`(`run.sh` 已跑过 `gate.sh`)。手动触发时若产物过期(超过 10 分钟)或不存在, 先自己跑一次 `bash scripts/upstream-sync/gate.sh`。
 - 找出**上次同步点 `BASE`**, 即本次要重演的那些二开提交的起点:
 
@@ -44,7 +48,7 @@ wc -l /tmp/pre-subjects.txt
 ## 1. 建工作分支
 
 ```bash
-git switch -c "sync/$VER" main
+git checkout -b "syncing/$VER" main
 ```
 
 ## 2. rebase
@@ -58,7 +62,7 @@ git rebase origin/main
 - `REWRITTEN=true`(上游重写了历史) → 用 `--onto` 把我们的提交重演到新上游之上:
 
 ```bash
-git rebase --onto origin/main "$BASE" "sync/$VER"
+git rebase --onto origin/main "$BASE" "syncing/$VER"
 ```
 
 merge 提交会被自动丢弃 —— 这是**对的**, 因为那些 merge 只是把旧上游历史并进来, 现在由新上游取代。
@@ -144,7 +148,9 @@ bash scripts/upstream-sync/deploy.sh --version "$VER"    # 分支与标签都还
 ## 7. 收尾(仅在部署成功时做)
 
 ```bash
-git branch -f main "sync/$VER" && git switch main      # main 指向已验证的提交
+git branch -f main refs/tags/sync/$VER     # main 指向已验证的提交
+git checkout main
+git branch -D "syncing/$VER"               # 工作分支使命完成; 版本由标签标记
 ```
 
 ⚠ `refs/upstream-sync/last` 要记的是**上游**的 commit, 不是我们 rebase 后的提交 —— 记错会让下一轮闸门误判"上游重写了历史":
@@ -208,7 +214,7 @@ bash scripts/upstream-sync/notify.sh --title "✅ 上游同步完成: 31 个提�
 
 ## 9. 失败时
 
-- **rebase 冲突解不动 / 对账不过 / 测试红** → `git rebase --abort`(或 `git switch main && git branch -D sync/$VER`), 线上与 `main` 原封不动。发一条 `--level warn` 通知, 说清卡在哪一步、需要你决定什么, 状态文件写 `"result": "needs_human"`。
+- **rebase 冲突解不动 / 对账不过 / 测试红** → `git rebase --abort`(或 `git checkout main && git branch -D "syncing/$VER"`), 线上与 `main` 原封不动。发一条 `--level warn` 通知, 说清卡在哪一步、需要你决定什么, 状态文件写 `"result": "needs_human"`。
 - **部署失败** → `deploy.sh` 已经自动回退并自己发了告警, 你只需在报告里补充冲突/测试结论。
 - **上游重写历史且 `BASE` 找不到** → 停下问人, 别猜着 rebase。
 - **命令被权限拒绝** → 状态文件写 `"result": "blocked_by_permissions"` 并在 `reason` 里写清是哪一步、
@@ -226,3 +232,5 @@ bash scripts/upstream-sync/notify.sh --title "✅ 上游同步完成: 31 个提�
 | 数据 | 全部在 `./data`(bind mount), 重建镜像不会丢; 不要动 |
 | 镜像落后 git | 别 `docker cp` 单文件; 要改就重建镜像(本 loop 就是干这个的) |
 | 时区 | 宿主机已 `Asia/Shanghai`; 别在脚本里做 UTC 换算 |
+| 本机 git | **2.17**(旧): 没有 `git switch`/`git restore`, `cherry-pick -q` 不支持 —— 用 `git checkout`; 引用标签写 `refs/tags/sync/<VER>` |
+| 同名引用 | 分支与标签同名会让 `rev-parse` 静默选错(tags 优先), 所以分支叫 `syncing/*`、标签叫 `sync/*` |
