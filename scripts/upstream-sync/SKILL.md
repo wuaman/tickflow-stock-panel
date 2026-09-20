@@ -14,6 +14,10 @@ description: 检查上游 shy3130/tickflow-stock-panel 是否有更新; 有则�
 3. **部署只走 `scripts/upstream-sync/deploy.sh`**, 它带安全不变量: 只允许部署带 `sync/<VER>` 标签的提交, HEAD 与标签不一致直接拒绝。
 4. **对账没全过就不部署**。宁可这次不同步、发一条"人工介入"通知, 也不要上一个可能丢了上游改动的版本。
 5. **不碰 `data/`**、不改容器内的代码(不要用 `docker cp` 打补丁 —— 那会造成代码与镜像不一致)。
+6. **调用本 loop 的脚本一律用仓库根的相对路径**:`bash scripts/upstream-sync/deploy.sh ...`。
+   权限清单是按相对路径前缀匹配的,**绝对路径(`bash /mnt/.../deploy.sh`)永远会被拒绝**;
+   而 `--permission-prompts none` 下拒绝是**静默的** —— 你会看到"没有输出/被拦", 不会看到询问。
+   被拒绝时不要换着花样重试, 按第 9 节写 `blocked_by_permissions` 并通知。
 
 ## 0. 起点与命名
 
@@ -207,6 +211,9 @@ bash scripts/upstream-sync/notify.sh --title "✅ 上游同步完成: 31 个提�
 - **rebase 冲突解不动 / 对账不过 / 测试红** → `git rebase --abort`(或 `git switch main && git branch -D sync/$VER`), 线上与 `main` 原封不动。发一条 `--level warn` 通知, 说清卡在哪一步、需要你决定什么, 状态文件写 `"result": "needs_human"`。
 - **部署失败** → `deploy.sh` 已经自动回退并自己发了告警, 你只需在报告里补充冲突/测试结论。
 - **上游重写历史且 `BASE` 找不到** → 停下问人, 别猜着 rebase。
+- **命令被权限拒绝** → 状态文件写 `"result": "blocked_by_permissions"` 并在 `reason` 里写清是哪一步、
+  哪条命令(照抄命令原文), 发 `--level warn` 通知。**不要**绕过权限(不要改用别的命令形态规避,
+  那既不可靠又不该做)。线上未被改动即代表安全。
 
 ## 环境速查(本项目特有, 每条都踩过)
 
