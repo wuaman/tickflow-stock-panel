@@ -36,7 +36,18 @@ install -D -m 644 "$REPO_ROOT/scripts/upstream-sync/SKILL.md" "$SKILL_DIR/SKILL.
 
 RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M).log"
 exec >>"$RUN_LOG" 2>&1
+# 本轮起点时间: archive-run.sh 靠它判断 last-run.json / last-report.md 是不是本轮的产物
+export SYNC_RUN_START_TS="$(date +%s)"
 log "=== 上游同步 loop 启动 (日志: $RUN_LOG) ==="
+
+# 每轮无论成败都归档成 .sync-loop/runs/<轮次>/ —— 事后想查"那轮做了什么"看这里。
+# 归档失败不影响本轮结论(它只是留痕)。
+finish() {
+  local code="$1"
+  bash "$REPO_ROOT/scripts/upstream-sync/archive-run.sh" --run-log "$RUN_LOG" >/dev/null 2>&1 \
+    || log "⚠ 归档失败(不影响本轮结论)"
+  exit "$code"
+}
 
 set +e
 bash "$REPO_ROOT/scripts/upstream-sync/gate.sh"
@@ -46,13 +57,13 @@ set -e
 case "$GATE_RC" in
   10)
     log "上游无更新, 本轮结束(未消耗 agent)"
-    exit 0
+    finish 0
     ;;
   0) : ;;
   *)
     bash "$REPO_ROOT/scripts/upstream-sync/notify.sh" --title "⚠️ 上游同步: 闸门执行失败" --level warn \
       --file <(printf 'gate.sh 退出码 %s, 本轮未同步。\n日志: %s\n' "$GATE_RC" "$RUN_LOG")
-    exit "$GATE_RC"
+    finish "$GATE_RC"
     ;;
 esac
 
@@ -74,10 +85,10 @@ log "agent 退出码: $AGENT_RC"
 # 兜底: agent 是否留下了本轮状态文件
 if [ -f "$RUN_STATE" ] && [ "$(stat -c %Y "$RUN_STATE")" -ge "$START_TS" ]; then
   log "agent 正常结束, 状态文件已更新"
-  exit 0
+  finish 0
 fi
 
 log "agent 未留下本轮状态文件 —— 兜底告警(可能被权限拦停/超时/崩溃)"
 bash "$REPO_ROOT/scripts/upstream-sync/notify.sh" --title "⚠️ 上游同步 loop 未正常结束" --level warn \
   --file <(printf 'agent 退出码 %s(124=超时 1 小时), 没有写出本轮状态文件。\n\n**线上未被改动即代表安全**: 同步全程在 `sync/*` 分支上进行, 只有部署脚本会碰容器。\n\n日志尾部:\n```\n%s\n```\n' "$AGENT_RC" "$(tail -n 30 "$RUN_LOG")")
-exit 1
+finish 1
