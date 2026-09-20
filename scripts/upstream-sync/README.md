@@ -128,10 +128,32 @@ SYNC_LOOP_STOP_BEFORE_DEPLOY=1 bash scripts/upstream-sync/run.sh
 
 | 路径 | 内容 |
 |---|---|
-| `.sync-loop/gate.env` | 闸门结论（上游 sha / 是否重写 / 新增数） |
+| `.sync-loop/runs/<轮次ID>/` | **每轮一份归档**（见下），轮次 ID 形如 `20260920-1101` |
+| `.sync-loop/last-run.json` | 最近一轮的结构化结果（每轮覆盖；归档里存有副本） |
+| `.sync-loop/last-report.md` | 最近一次实际推送给飞书的正文 |
+| `.sync-loop/gate.env` | 最近一次闸门结论（上游 sha / 是否重写 / 新增数） |
 | `.sync-loop/versions.tsv` | 已部署版本 → 镜像 ID / git 标签 / 时间（保留最近 3 个） |
-| `.sync-loop/last-run.json` | 每轮结果；`run.sh` 靠它判断本轮是否正常结束 |
-| `.sync-loop/logs/` | 每轮完整日志 |
+| `.sync-loop/logs/` | 每轮 stdout 与通知留痕 |
+
+### 每轮归档里有什么
+
+`run.sh` 每轮结束（**含"上游无更新"和失败的情况**）都会调 `archive-run.sh` 存一份：
+
+| 文件 | 内容 |
+|---|---|
+| `summary.md` | **人读的说明**：本轮结论 / 带来的新功能 / 冲突文件 / 可回退版本 / 推送正文 |
+| `session.jsonl` | **无头 agent 的完整工具调用轨迹**（harness 的转录会随会话清理消失，这份是保底） |
+| `report.md` | 实际推送给飞书的正文 |
+| `run.log` | `run.sh` 的完整 stdout/stderr |
+| `run.json` | 结构化结果（上游范围、重演数、测试结论、回退命令…） |
+| `gate.env` / `gate-subjects.txt` | 本轮上游变更清单 |
+
+保留最近 10 轮，旧的自动清理。手工归档某一轮（例如补记一次人工操作）：
+
+```bash
+scripts/upstream-sync/archive-run.sh --list
+scripts/upstream-sync/archive-run.sh --runid 20260920-1101 --note "手工补部署" --session <某个.jsonl>
+```
 
 `data/` 不参与本 loop 的任何写入 —— 数据永远是安全的。
 

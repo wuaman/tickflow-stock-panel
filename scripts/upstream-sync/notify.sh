@@ -36,6 +36,9 @@ else
 fi
 BODY="$(printf '%s\n\n---\n%s · %s' "$BODY" "$(date '+%F %T')" "$(hostname)")"
 
+# 留一份"最近一次实际推送的正文", 供 archive-run.sh 归档进 .sync-loop/runs/<轮次>/report.md
+printf '%s\n' "$BODY" >"$STATE_DIR/last-report.md"
+
 WEBHOOK="$(head -n1 "$WEBHOOK_FILE" 2>/dev/null | tr -d ' \t\r\n' || true)"
 SECRET="$(head -n1 "$WEBHOOK_SECRET_FILE" 2>/dev/null | tr -d ' \t\r\n' || true)"
 
