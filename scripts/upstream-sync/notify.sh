@@ -45,6 +45,9 @@ if [ "$DRY" = 1 ] || [ -z "$WEBHOOK" ]; then
   exit 0
 fi
 
+# 无论成功与否都留一份本地记录 —— 否则"飞书到底发出去了什么"事后无从核对
+printf '===== %s [%s] %s (已发飞书) =====\n%s\n' "$(date '+%F %T')" "$LEVEL" "$TITLE" "$BODY" >>"$LOG_DIR/notify.log"
+
 TITLE="$TITLE" LEVEL="$LEVEL" BODY="$BODY" WEBHOOK="$WEBHOOK" SECRET="${SECRET:-}" \
   python3 - <<'PY'
 import base64, hashlib, hmac, json, os, sys, time, urllib.request
