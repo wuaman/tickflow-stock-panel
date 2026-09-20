@@ -178,39 +178,80 @@ git push fork --tags --force-with-lease
 
 ```json
 {"ts": "2026-09-20T19:52:00+08:00", "result": "deployed", "version": "20260920",
- "upstream": "0cd46f9", "new_commits": 31, "replayed": 31, "conflicts": ["backend/app/api/watchlist.py"],
- "tests": "通过", "retained": ["20260920", "20260913", "baseline-20260920"],
- "rollback_cmd": "scripts/upstream-sync/rollback.sh --to 20260913"}
+ "upstream": "0cd46f9", "new_commits": 31, "replayed": 29,
+ "new_features": ["AI 对话助手(悬浮球/⌘K 呼出)", "自选页「加入日期」「加入以来」两列"],
+ "conflicts": ["backend/app/api/watchlist.py"],
+ "tests": "无新增失败(对照同步前 main)", "retained": ["20260920", "baseline-20260920"],
+ "rollback_cmd": "scripts/upstream-sync/rollback.sh --to baseline-20260920"}
 ```
 
 然后推送飞书(正文写进临时文件, 别用超长命令行):
 
 ```bash
-bash scripts/upstream-sync/notify.sh --title "✅ 上游同步完成: 31 个提交已上线" --level ok --file /tmp/report.md
+bash scripts/upstream-sync/notify.sh --title "✅ 上游同步: 新增 <N> 项功能, 已上线 <版本>" --level ok --file /tmp/report.md
 ```
 
-- 验证模式(`$STOP_BEFORE_DEPLOY=1`)下标题改用 `"🔎 上游同步已验证, 待放行: 31 个提交"`, `--level warn`, 报告末尾附上放行命令。
+- 验证模式(`$STOP_BEFORE_DEPLOY=1`)下标题改用 `"🔎 上游同步已验证, 待放行: <N> 项功能"`, `--level warn`, 报告末尾附上放行命令。
 - 需要人介入时用 `"⚠️ 上游同步需人工处理: <卡在哪一步>"`, `--level warn`。
 
-### 报告模板(飞书 markdown, 别用表格 —— 飞书卡片对表格支持差)
+### 写报告前必须先读上游变更(别只抄 commit 标题)
+
+**这份报告的第一读者是使用者, 不是开发者** —— 他要的是"这次更新给我带来了什么", 而不是提交清单。所以先花几步读实际内容:
+
+```bash
+# 1) 上游这轮改了哪些文件、哪些是新增功能
+git log --no-merges --format='%h %s' <上次同步点对应的上游提交>..origin/main
+git diff --name-only <上次同步点> origin/main
+
+# 2) 上游的 README 差异 —— 上游会用"用户能做什么"的语言描述新功能, 直接借用最准
+git diff <上次同步点> origin/main -- README.md
+
+# 3) 拿不准某个功能到底做了什么时, 看它的实际改动
+git show --stat <某个上游提交>
+git diff <上次同步点> origin/main -- <相关文件>
+```
+
+### 报告模板(飞书 markdown, **别用表格** —— 飞书卡片对表格支持差)
+
+按"使用者最关心 → 次要"排序。飞书单条有长度上限(`notify.sh` 会在 4500 字符截断), 所以要**挑**不要全列:
 
 ```markdown
-**上游新增**: 31 个提交 (0cd46f9)
-- feat(assistant): AI 对话助手 — 完全解耦扩展模块
-- feat(watchlist): 新增「加入日期」「加入以来」两列
+**🎉 新功能(你能用上的)**
+1. **AI 对话助手** — 悬浮球 / 侧栏 AI 徽标旁 / ⌘K 都能呼出。直接问"今天大盘怎么样""600519 的财务和走势", 助手在你本地数据上调工具取数后逐字作答, 每次取数都能展开核对; 覆盖个股·大盘·板块·自选·持仓·信号·策略·因子。
+2. **自选页多了「加入日期」「加入以来」两列** — 日K 图上也会标出"加入自选"那天(周末加的会落到最近交易日)。
+3. ...
+
+**🔧 修复(会影响你日常使用的)**
+- ETF 监控不再拿上一交易日的快照误报
+- 长假后 MA60 等指标不再算成空
+- 板块轮动的「1 小时前」午后不再拿 11:30 的口径对照
 - ...
 
-**本 fork 重演**: 31 个二开提交全部成功, 无丢失
-**上游历史**: 未重写 / ⚠️ 被 force push 重写, 已用 --onto 重演
-**冲突处理** (3 处):
-- `backend/app/api/watchlist.py` — 上游加了加入日期的列定义, 我们把自定义财务列接在它们后面
+**⚙️ 本次同步做了什么**
+- 上游 40 个提交 (`0cd46f9` → `a31c169`)
+- ⚠️ 上游改写过历史 → 用 `--onto` 把我们的 30 个二开提交重演到新上游之上
+- 12 个文件有冲突, 逐个人工解决(见下)
+- 对账 3/3 通过 · 测试无新增失败(与同步前 main 对照) · 健康检查通过
+- 3 个提交变空被丢: 已逐一核对, 都是上游已含同样修复, 无内容丢失
+
+**🧩 冲突怎么解的(这里最需要你复核)**
+- `backend/app/api/watchlist.py` — 上游加了「加入日期」列的取数, 我们把自定义财务列接在它后面
 - ...
 
-**验证**: 对账 3/3 通过 · pytest 通过(N passed, M flaky 已核对) · 健康检查通过
-**部署**: 已上线 `20260920`
-**可回退版本**: `20260920`(当前) / `20260913` / `baseline-20260920`
-回退: `scripts/upstream-sync/rollback.sh --to 20260913`
+**📦 版本与回退**
+当前 `20260920`(v0.3.0)
+回退目标 `baseline-20260920` —— 回退: `scripts/upstream-sync/rollback.sh --to baseline-20260920`
+更早版本: `rollback.sh --list`
 ```
+
+写法要求:
+
+- **新功能必须写"使用者能做什么"**, 不要写"重构了 XX 模块""新增了 YY 接口"这类实现层描述。
+  写完自问一句: 一个只在网页上点的人, 看完知道去哪儿、能干什么吗?
+- **不确定就不要写**。宁可少写一条, 也不要猜一个功能是怎么用的 —— 报告是使用者唯一的知情来源, 编造比遗漏更糟。
+- 修复只挑**影响日常使用**的(数据口径、指标错值、页面显示), 纯内部重构不列。
+- 同步动作与冲突解决要**如实**: 被丢的提交、失败的测试、没做到的步骤, 全部写出来, 不要只报喜。
+- 没有新功能时就直说"本次上游以修复为主, 无新功能", 别硬凑。
 
 ## 9. 失败时
 
