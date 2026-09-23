@@ -93,10 +93,20 @@ fi
 if [ -z "$SESSION" ] && [ -d "$TRANSCRIPT_DIR" ]; then
   START_TS="$(stat -c %Y "${RUN_LOG:-$RUN_DIR}" 2>/dev/null || echo 0)"
   # 优先取本轮开始之后被写过、且含本 loop skill 字样的转录, 避免误抓用户自己的会话
-  SESSION="$(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -newermt "@$((START_TS - 120))" -printf '%T@ %p\n' 2>/dev/null \
-             | sort -rn | awk '{print $2}' | while read -r f; do
-                 head -c 200000 "$f" | grep -q 'sync-upstream' && { echo "$f"; break; }
-               done)"
+  # ⚠ 先把候选列表整个物化, 再在 shell 里循环 —— 原实现是
+  #   `find … | sort -rn | awk … | while read f; do … break; done`
+  #   : 命中即 break 会让 while 提前关闭管道, 上游 find/sort 收到 SIGPIPE,
+  #   在 set -o pipefail 下整条命令替换返回 141 → set -e 直接中断脚本,
+  #   后面的 summary.md / session.jsonl(本归档最有价值的两份)静默不产出。
+  #   候选文件越多越容易触发, 实测 2026-09-23 那轮 100% 复现。
+  CANDIDATES="$(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' \
+                -newermt "@$((START_TS - 120))" -printf '%T@ %p\n' 2>/dev/null | sort -rn)"
+  while read -r _ts cand; do
+    [ -n "$cand" ] || continue
+    # 用进程替换而非管道: grep -q 命中即退出, 管道形态下 head 会拿到 SIGPIPE,
+    # pipefail 会把"匹配成功"误判成失败而漏掉这份转录
+    if grep -q 'sync-upstream' <(head -c 200000 "$cand"); then SESSION="$cand"; break; fi
+  done <<<"$CANDIDATES"
 fi
 if [ -n "$SESSION" ] && [ -f "$SESSION" ]; then
   cp -f "$SESSION" "$RUN_DIR/session.jsonl" && log "  session.jsonl (来自 $(basename "$SESSION"))"
