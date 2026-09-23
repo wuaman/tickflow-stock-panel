@@ -27,6 +27,13 @@ def test_pipeline_daily_window_ends_on_beijing_today(monkeypatch, tmp_path) -> N
 
     raising=False: 未修复代码没有调用 cn_today, 钉了也不会被用到,
     仍走 date.today() → 与 2026-03-02 不等。
+
+    本 fork 另有一层 end 封顶 (daily_end = last_completed_trading_day(), 见
+    daily_pipeline 中「日K拉取的 end 边界」注释): 盘中/周末窗口右端回退到最近
+    已收盘交易日, 避免扶摇 dump 未发布时退化逐股接口触发限流与完整性自愈死循环。
+    收盘后 (调度默认 15:35) 该封顶返回的就是今天, 与上游语义一致。
+    这里把封顶也钉到同一个假「今天」, 使断言仍校验上游的时区契约:
+    若代码回退成 date.today(), 右端会是真实本地日 (≠ BJ) 而失败。
     """
     captured: list[date] = []
 
@@ -35,6 +42,9 @@ def test_pipeline_daily_window_ends_on_beijing_today(monkeypatch, tmp_path) -> N
         raise _StopError()
 
     monkeypatch.setattr(daily_pipeline, "cn_today", lambda: BJ, raising=False)
+    monkeypatch.setattr(
+        daily_pipeline, "last_completed_trading_day", lambda now=None: BJ, raising=False
+    )
     monkeypatch.setattr(instrument_sync, "sync_instruments", lambda data_dir: 0)
     monkeypatch.setattr(daily_pipeline, "_resolve_universe", lambda capset, repo=None: ["600000.SH"])
     monkeypatch.setattr(daily_pipeline, "_invalidate", lambda table=None: None)
