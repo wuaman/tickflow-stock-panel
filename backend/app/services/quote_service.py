@@ -1006,12 +1006,9 @@ class QuoteService:
         # 转发全空列会跳过回退计算, 当日换手/振幅将永远为空且每轮实时覆写自锁
         keep = [c for c in keep if c == "symbol" or df[c].null_count() < len(df)]
         out = df.select(keep)
-        # 全 null 的 ext 列 (如 fuyao 恒不提供 turnover_rate/amplitude) 整列丢弃:
-        # 下游 compute_enriched_today / _compute_limit_signals_today 按列存在性
-        # 决定是否启用自有计算, 全 null 列会挡住换手率股本回退等计算路径。
-        for c in ("change_pct", "change_amount", "amplitude", "turnover_rate"):
-            if c in out.columns and out[c].null_count() == out.height:
-                out = out.drop(c)
+        # (本 fork 曾单独丢弃 change_pct/change_amount/amplitude/turnover_rate 四个全 null
+        #  ext 列修同一个 bug; 上游上面这行的通用过滤已完全覆盖 —— 全 null 列在 select
+        #  前就没了, 故原专用循环删除, 语义无损失)
         # 实时 API 的 turnover_rate 入口契约为小数制(0.05 = 5%).
         # enriched 内部统一存百分数值(5 = 5%), 后续页面/筛选直接展示和比较。
         if "turnover_rate" in out.columns:
