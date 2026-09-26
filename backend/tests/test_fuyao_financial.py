@@ -152,8 +152,11 @@ class _PerSymbolIncomeClient(_FakeFinClient):
         super().__init__()
         self.rows_by_symbol = rows_by_symbol
 
-    def financial_statements(self, stmt, thscode, limit=1):
+    def financial_statements(self, stmt, thscode, limit=1, period=None):
+        # period: 本 fork 为扶摇财务深历史给 client 增了报表维度参数, 假客户端
+        # 需与真实 FuyaoClient 签名一致, 否则 provider 传 period 时报 TypeError。
         self.stmt_calls.append((stmt, thscode, limit))
+        self.stmt_periods.append(period)
         return [dict(self.rows_by_symbol[thscode], thscode=thscode)]
 
 
