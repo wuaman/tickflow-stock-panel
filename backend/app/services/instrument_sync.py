@@ -72,12 +72,53 @@ def _fetch_instruments_via_provider() -> list[dict] | None:
     return rows
 
 
+def _align_to_schema(df: pl.DataFrame, other: pl.DataFrame) -> pl.DataFrame:
+    """把 other 对齐到 df 的列顺序与 dtype (other 缺列补 null), 供 vertical concat。"""
+    exprs = [
+        pl.col(name).cast(dtype, strict=False) if name in other.columns
+        else pl.lit(None, dtype=dtype).alias(name)
+        for name, dtype in df.schema.items()
+    ]
+    return other.select(exprs)
+
+
+def _carry_over_failed_exchanges(
+    df: pl.DataFrame, failed: list[str], out: Path
+) -> pl.DataFrame | None:
+    """用既有维表补齐同步失败的交易所, 返回合并帧; 无既有维表可补时返回 None。
+
+    补齐行**保留各自原 as_of** —— 下游 indicators 以 `维表 as_of == 行情日` 判定
+    权威涨跌停价是否可信, 陈旧行会自然回退理论价; 若统一盖当日日期, 等于把昨日
+    涨跌停价冒充当日权威价 (涨停漏判 + 假涨停混入)。
+    """
+    try:
+        prev = pl.read_parquet(out) if out.exists() else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取既有 instruments 维表失败: %s", e)
+        prev = None
+    if prev is None or prev.is_empty() or "exchange" not in prev.columns:
+        return None
+    carried = prev.filter(pl.col("exchange").is_in(failed))
+    if carried.is_empty():
+        return None
+    logger.warning(
+        "instruments 同步不完整: %s 拉取失败, 已用既有维表 %d 行补齐 (保留原 as_of)",
+        "/".join(failed), carried.height,
+    )
+    return pl.concat([df, _align_to_schema(df, carried)], how="vertical")
+
+
 def sync_instruments(data_dir: Path) -> int:
     """全量同步标的维表 → data/instruments/instruments.parquet。
 
     返回写入的行数。
+
+    任一交易所拉取失败时**不得用残缺数据覆盖维表**: 维表是名称/股本/涨跌停价的
+    唯一来源, 一次上游 503 会让缺的那部分标的 (名称显示、按名称搜索、涨跌停价)
+    整天失效。改为用既有维表的对应交易所行补齐; 连既有维表都没有则放弃本次写入。
     """
     all_rows = _fetch_instruments_via_provider()
+    failed: list[str] = []
     if all_rows is None:
         # 未命中非 tickflow provider → 走 tickflow 直连
         tf = get_client()
@@ -88,7 +129,11 @@ def sync_instruments(data_dir: Path) -> int:
                 if items:
                     all_rows.extend(_flatten_instruments(items))
                     logger.info("instruments %s: %d stocks", ex, len(items))
+                else:
+                    failed.append(ex)
+                    logger.warning("instruments %s: 返回空", ex)
             except Exception as e:
+                failed.append(ex)
                 logger.warning("get_instruments(%s) failed: %s", ex, e)
 
     if not all_rows:
@@ -100,6 +145,16 @@ def sync_instruments(data_dir: Path) -> int:
 
     out = data_dir / "instruments" / "instruments.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
+    if failed:
+        merged = _carry_over_failed_exchanges(df, failed, out)
+        if merged is None:
+            logger.error(
+                "instruments 同步残缺 (%s 失败) 且无既有维表可补齐 → 放弃本次写入, 保留原文件",
+                "/".join(failed),
+            )
+            return 0
+        df = merged
+
     atomic_write_parquet(df, out)
 
     logger.info("instruments synced: %d rows → %s", df.height, out)
