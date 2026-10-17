@@ -86,8 +86,14 @@ export function useFinancialShares(symbol?: string) {
 export function useFinancialSync() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: ({ table, scope }: { table: string; scope: 'all' | 'watchlist' }) =>
-      api.financialSync(table, scope),
+    // 兼容两种调用: 本 fork 的财务扩展传 { table, scope }; 上游数据页的
+    // FinancialSyncPanel 只传表名(默认全市场)。上游 v0.3.6 新增该面板后
+    // 与二开改动撞上, 故在 hook 层归一化, 避免改动上游组件。
+    mutationFn: (input: string | { table: string; scope: 'all' | 'watchlist' }) => {
+      const table = typeof input === 'string' ? input : input.table
+      const scope = typeof input === 'string' ? 'all' : input.scope
+      return api.financialSync(table, scope)
+    },
     // 点击瞬间立即刷新 status: 让后端 is_syncing=True 马上反映到 UI,
     // 避免 mutation 阻塞(全量同步需数分钟)期间界面无变化。
     onMutate: () => {
