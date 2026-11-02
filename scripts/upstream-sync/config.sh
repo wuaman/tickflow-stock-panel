@@ -8,7 +8,8 @@ set -euo pipefail
 
 # `${BASH_SOURCE[0]:-$0}` 兜底: 本文件正常由 bash 执行, 但被非 bash shell(zsh 等)source
 # 时 BASH_SOURCE 不存在, 少了兜底 REPO_ROOT 会解析成空路径
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
+# SYNC_REPO_ROOT: run.sh 把 park.sh/config.sh 拷到 .sync-loop/bin/ 执行时(rebase 中途工作区里没有脚本), 由它指明仓库根
+REPO_ROOT="${SYNC_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
 export REPO_ROOT
 
 # ---- 运行时对象 ----------------------------------------------------------
@@ -25,6 +26,8 @@ VERSIONS_FILE="$STATE_DIR/versions.tsv"   # 版本<TAB>镜像ID<TAB>git ref<TAB>
 GATE_ENV="$STATE_DIR/gate.env"            # gate.sh 产物, 可 source
 GATE_SUBJECTS="$STATE_DIR/gate-subjects.txt"
 RUN_STATE="$STATE_DIR/last-run.json"      # 每轮结束由 skill 写入, run.sh 兜底检查
+RESUME_ENV="$STATE_DIR/resume.env"        # 断点存档(park.sh 写, run.sh 读), 存在 = 上一轮没跑完
+RESUME_PARTIAL="$STATE_DIR/resume-partial.diff"  # 卡住那个提交的冲突半成品, 仅供参考
 
 # ---- 飞书 ----------------------------------------------------------------
 WEBHOOK_FILE="$REPO_ROOT/data/user_data/feishu_webhook.txt"
@@ -33,6 +36,8 @@ WEBHOOK_SECRET_FILE="$REPO_ROOT/data/user_data/feishu_webhook_secret.txt"
 # ---- 同步语义 ------------------------------------------------------------
 SYNC_REF="refs/upstream-sync/last"   # 上次成功同步到的上游 commit
 KEEP_VERSIONS=3                      # 本地保留几版可回退
+AGENT_TIMEOUT=10800                  # 单轮 agent 上限(秒) = 3 小时; 27B 模型 rebase+构建 1 小时不够
+MAX_RESUME_ATTEMPTS=3                # 同一个上游目标最多续跑几次, 超过就丢弃存档从头来并告警
 
 # 验证模式: =1 时 agent 做完 rebase + 对账 + 测试就停下, 不部署 —— 留给人先看 rebase 结果。
 # 用法: SYNC_LOOP_STOP_BEFORE_DEPLOY=1 bash scripts/upstream-sync/run.sh

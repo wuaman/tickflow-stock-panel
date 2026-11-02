@@ -34,6 +34,17 @@ fi
 SKILL_DIR="$REPO_ROOT/.claude/skills/sync-upstream"
 install -D -m 644 "$REPO_ROOT/scripts/upstream-sync/SKILL.md" "$SKILL_DIR/SKILL.md"
 
+# .sync-loop/ 的忽略规则在我们自己的二开提交里(.gitignore); rebase 重演到它之前, 状态目录是"未跟踪且未忽略",
+# agent 解冲突时一句 `git add -A` 就会把日志/存档提交进去。写进 .git/info/exclude(本地, 不随分支切换变化)
+EXCLUDE_FILE="$(git rev-parse --git-path info/exclude)"
+grep -qxF '.sync-loop/' "$EXCLUDE_FILE" 2>/dev/null || echo '.sync-loop/' >>"$EXCLUDE_FILE"
+
+# 存档脚本拷到仓库外的 .sync-loop/bin/(git 不管, rebase 不会动) —— agent 若停在 rebase 中途,
+# 工作区里根本没有 scripts/upstream-sync/, 收尾时只能从这里调 park.sh
+PARK_BIN="$STATE_DIR/bin"
+install -D -m 644 "$REPO_ROOT/scripts/upstream-sync/park.sh" "$PARK_BIN/park.sh"
+install -D -m 644 "$REPO_ROOT/scripts/upstream-sync/config.sh" "$PARK_BIN/config.sh"
+
 RUN_LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M).log"
 exec >>"$RUN_LOG" 2>&1
 # 本轮起点时间: archive-run.sh 靠它判断 last-run.json / last-report.md 是不是本轮的产物
@@ -72,9 +83,44 @@ source "$GATE_ENV"
 START_TS="$(date +%s)"
 log "闸门通过: upstream=$UPSTREAM last=${LAST_SYNC:-<未记录>} new=$NEW_COUNT rewritten=$REWRITTEN"
 
+# ---- 断点续跑: 上一轮没跑完(park.sh 留了存档)且存档仍然有效 → 只重演剩下的提交 ----
+# 续跑时同步目标钉在上一轮的上游 commit(不追最新), 比它新的上游提交留给下一轮 —— 否则已解的冲突全白做。
+export SYNC_RESUME=0 SYNC_TARGET="$UPSTREAM"
+discard_resume() {
+  log "丢弃断点存档: $1"
+  rm -f "$RESUME_ENV" "$RESUME_PARTIAL"
+  git update-ref -d refs/upstream-sync/resume-done 2>/dev/null || true
+}
+if [ -f "$RESUME_ENV" ]; then
+  # shellcheck disable=SC1090
+  source "$RESUME_ENV"
+  if [ "$REWRITTEN" = true ]; then
+    discard_resume "上游重写了历史"
+  elif ! git cat-file -e "${RESUME_DONE:-x}^{commit}" 2>/dev/null || ! git cat-file -e "${RESUME_FROM:-x}^{commit}" 2>/dev/null; then
+    discard_resume "存档里的提交已不存在"
+  elif ! git merge-base --is-ancestor "$RESUME_FROM" main; then
+    discard_resume "main 被改写过, 存档的起点不在 main 历史里"
+  elif ! git merge-base --is-ancestor "$RESUME_TARGET" origin/main; then
+    discard_resume "存档的上游目标已不在 origin/main 历史里"
+  elif [ "${RESUME_ATTEMPTS:-0}" -gt "$MAX_RESUME_ATTEMPTS" ]; then
+    discard_resume "已中断 $RESUME_ATTEMPTS 次(上限 $MAX_RESUME_ATTEMPTS), 从头来"
+    bash "$REPO_ROOT/scripts/upstream-sync/notify.sh" --title "⚠️ 上游同步: 续跑 $RESUME_ATTEMPTS 次仍未完成, 已丢弃进度从头来" --level warn \
+      --file <(printf '同一个上游目标 `%s` 连续 %s 轮没跑完, 可能每次都卡在同一处。\n本轮从头 rebase; 若再超时请人工看日志: %s\n' "${RESUME_TARGET:0:12}" "$RESUME_ATTEMPTS" "$RUN_LOG")
+  else
+    export SYNC_RESUME=1 SYNC_TARGET="$RESUME_TARGET" \
+      SYNC_RESUME_DONE="$RESUME_DONE" SYNC_RESUME_FROM="$RESUME_FROM" \
+      SYNC_RESUME_STOPPED="${RESUME_STOPPED:-}" SYNC_RESUME_ATTEMPTS="$RESUME_ATTEMPTS"
+    log "断点续跑(第 $RESUME_ATTEMPTS 次): 目标=${RESUME_TARGET:0:12} 已完成=$(git rev-list --count "$RESUME_TARGET..$RESUME_DONE") 个提交, 剩余=$(git rev-list --count --no-merges "$RESUME_FROM..main") 个"
+    if [ "$RESUME_TARGET" != "$UPSTREAM" ]; then
+      log "上游在那之后又有 $(git rev-list --count "$RESUME_TARGET..$UPSTREAM") 个新提交, 留给下一轮"
+    fi
+  fi
+fi
+
 set +e
 # --permission-prompts none: 权限清单之外的操作直接拒绝, 而不是挂起等超时(无人值守必须)
-timeout 3600 claude -p "/sync-upstream" \
+# -k 60: 到点先 TERM, 60 秒还不退就 KILL
+timeout -k 60 "$AGENT_TIMEOUT" claude -p "/sync-upstream" \
   --settings "$REPO_ROOT/scripts/upstream-sync/settings-sync-loop.json" \
   --permission-mode acceptEdits \
   --permission-prompts none
@@ -89,6 +135,20 @@ if [ -f "$RUN_STATE" ] && [ "$(stat -c %Y "$RUN_STATE")" -ge "$START_TS" ]; then
 fi
 
 log "agent 未留下本轮状态文件 —— 兜底告警(可能被权限拦停/超时/崩溃)"
+
+# 存档半截进度 + 恢复仓库到 main(否则工作区停在 rebase 中途, 下一轮连本脚本都找不到)
+set +e
+SYNC_REPO_ROOT="$REPO_ROOT" bash "$PARK_BIN/park.sh" "$SYNC_TARGET"
+PARK_RC=$?
+set -e
+if [ "$PARK_RC" -eq 0 ] && [ -f "$RESUME_ENV" ]; then
+  PARK_NOTE="进度已存档, 下一轮从断点续跑(\`$RESUME_ENV\`)。"
+elif [ "$PARK_RC" -eq 0 ]; then
+  PARK_NOTE="没有可存的进度, 仓库已恢复到 main, 下一轮从头来。"
+else
+  PARK_NOTE="⚠ 存档失败(park.sh 退出码 $PARK_RC), 仓库可能还停在 rebase 中途 —— **需人工处理**, 否则下一轮 cron 找不到脚本。"
+fi
+log "$PARK_NOTE"
 bash "$REPO_ROOT/scripts/upstream-sync/notify.sh" --title "⚠️ 上游同步 loop 未正常结束" --level warn \
-  --file <(printf 'agent 退出码 %s(124=超时 1 小时), 没有写出本轮状态文件。\n\n**线上未被改动即代表安全**: 同步全程在 `sync/*` 分支上进行, 只有部署脚本会碰容器。\n\n日志尾部:\n```\n%s\n```\n' "$AGENT_RC" "$(tail -n 30 "$RUN_LOG")")
+  --file <(printf 'agent 退出码 %s(124/137=超时 %s 小时), 没有写出本轮状态文件。\n\n%s\n\n**线上未被改动即代表安全**: 同步全程在 `syncing/*` 分支上进行, 只有部署脚本会碰容器。\n\n日志尾部:\n```\n%s\n```\n' "$AGENT_RC" "$((AGENT_TIMEOUT / 3600))" "$PARK_NOTE" "$(tail -n 30 "$RUN_LOG")")
 finish 1
