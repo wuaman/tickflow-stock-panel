@@ -26,7 +26,8 @@ run.sh (cron)
 
 | 文件 | 作用 |
 |---|---|
-| `run.sh` | cron 入口：闸门 → 起 agent → 兜底告警 |
+| `run.sh` | cron 入口：闸门 → (有存档则续跑) → 起 agent(上限 3 小时) → 没跑完就存档 + 兜底告警 |
+| `park.sh` | 断点存档：agent 中断时把已 rebase 的进度存成 `refs/upstream-sync/resume-done` + `.sync-loop/resume.env`，并把仓库恢复到 `main` |
 | `gate.sh` | 低成本判断上游有无更新 / 是否被 force push 重写 |
 | `SKILL.md` | agent 行动手册（**权威版本**；`run.sh` 每次自动安装到 `.claude/skills/sync-upstream/`） |
 | `settings-sync-loop.json` | 无人值守的权限清单（只放行 git/docker/本目录脚本） |
@@ -159,6 +160,18 @@ scripts/upstream-sync/archive-run.sh --runid 20260920-1101 --note "手工补部�
 
 `data/` 不参与本 loop 的任何写入 —— 数据永远是安全的。
 
+## 断点续跑
+
+27B 本地模型一轮 rebase(四十多个二开提交、多处冲突) + 构建经常超过 1 小时，所以：
+
+- 单轮上限 3 小时(`config.sh` 的 `AGENT_TIMEOUT`)。
+- 超时/崩溃时 `run.sh` 调 `park.sh` 存档：已 rebase 好的提交、卡在哪个提交、冲突半成品(`resume-partial.diff`，仅参考)。
+  `park.sh` 从 `.sync-loop/bin/` 执行 —— rebase 中途工作区里没有 `scripts/upstream-sync/`。
+- 下一轮 `run.sh` 校验存档(上游没重写、main 没改写、提交都在)后导出 `SYNC_RESUME=1`，skill 用
+  `git rebase --onto <已完成> <卡住提交的父提交>` 只重演剩下的；**同步目标钉在上一轮的上游 commit**，更新的上游提交留给再下一轮。
+- 同一目标中断超过 3 次(`MAX_RESUME_ATTEMPTS`)就丢弃存档从头来并告警。
+- 部署保护：工作分支已打 `sync/*` 标签(可能已进入 deploy.sh)时 `park.sh` 什么都不动，需人工确认。
+
 ## 回退粒度
 
 同一版本号在三处一致：git 标签 `sync/<版本>`、镜像标签 `$IMAGE:<版本>`、`versions.tsv` 一行。回退时三者一起回，避免出现"代码是旧的、镜像是新的"这种最难查的状态。
@@ -174,7 +187,9 @@ scripts/upstream-sync/archive-run.sh --runid 20260920-1101 --note "手工补部�
 | 请求 401 | 凭据变量选错了：`ANTHROPIC_AUTH_TOKEN` 与 `ANTHROPIC_API_KEY` 对调再试 |
 | 路径变成 `/v1/v1/messages` | `ANTHROPIC_BASE_URL` 多带了 `/v1` 后缀，去掉 |
 | cron 跑了但什么都没发生 | 上游没更新（正常，看 `.sync-loop/logs/`）；或 CLI 未登录 |
-| 收到"未正常结束"告警 | agent 被权限拦停/超时，看日志尾部；线上未被改动即代表安全 |
+| 收到"未正常结束"告警 | agent 被权限拦停/超时(上限 3 小时)，看日志尾部；线上未被改动即代表安全。进度已自动存档，下一轮从断点续跑 |
+| 想放弃断点、下一轮从头来 | `rm .sync-loop/resume.env .sync-loop/resume-partial.diff; git update-ref -d refs/upstream-sync/resume-done` |
+| 仓库停在 rebase 中途、cron 报找不到 run.sh | run.sh 本身被杀(重启/断电)来不及存档。手动: `SYNC_REPO_ROOT=$PWD bash .sync-loop/bin/park.sh "$(. .sync-loop/gate.env; echo $UPSTREAM)"` |
 | agent 说"命令被拒绝" | 权限判断按**整条命令的首个程序**匹配：`echo "==="; git diff` 这种复合命令会被整条拒（里面的 git 在白名单也没用）。现状是放行整个 Bash 工具，若你收紧了清单请记住这条 |
 | 东财源 Connection refused | shim 没跟 app 一起重启 —— `docker restart TickFlow_FinancialShim` |
 | 上游 force push 重写历史 | gate 会报 `rewritten=true`，skill 改用 `git rebase --onto` 重演 |
