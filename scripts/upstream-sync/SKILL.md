@@ -27,6 +27,9 @@ description: 检查上游 shy3130/tickflow-stock-panel 是否有更新; 有则�
   (解析顺序里 tags 优先于 heads), `git rev-parse sync/<VER>` 会静默解析成标签而不是分支。
 - **本机 git 是 2.17**, 没有 `git switch` / `git restore`, `cherry-pick -q` 也不支持 —— 一律用
   `git checkout`; 需要引用标签时写全 `refs/tags/sync/<VER>`。
+- **同步目标 = `$SYNC_TARGET`**(`run.sh` 导出的上游 commit; 常规轮就是 `origin/main`, 续跑轮是上一轮的目标)。
+  下文命令里一律写 `${SYNC_TARGET:-origin/main}` —— 手动触发没有这个变量时自动退回 `origin/main`。
+  **不要**在续跑轮里改成 `origin/main`: 比目标新的上游提交故意留给下一轮。
 - 先读闸门产物 `.sync-loop/gate.env`(`run.sh` 已跑过 `gate.sh`)。手动触发时若产物过期(超过 10 分钟)或不存在, 先自己跑一次 `bash scripts/upstream-sync/gate.sh`。
 - 找出**上次同步点 `BASE`**, 即本次要重演的那些二开提交的起点:
 
@@ -42,28 +45,50 @@ git rev-parse "$BASE"   # 必须在 HEAD 历史里, 否则停下问人
 记录**重演前的提交标题清单**, 后面要对账:
 
 ```bash
-git log --no-merges --format=%s "$BASE"..HEAD > /tmp/pre-subjects.txt
+git log --no-merges --format=%s "$BASE"..main > /tmp/pre-subjects.txt
 wc -l /tmp/pre-subjects.txt
 ```
 
 ## 1. 建工作分支
 
 ```bash
-git checkout -b "syncing/$VER" main
+git checkout -B "syncing/$VER" main     # -B: 同名残留分支(上次失败留下的)直接重置
 ```
+
+### 续跑模式(`$SYNC_RESUME=1`)—— 上一轮超时/中断, 进度已由 `park.sh` 存档
+
+`run.sh` 已校验过存档有效, 并导出了:
+
+- `SYNC_RESUME_DONE`: 已 rebase 好的提交(建在 `$SYNC_TARGET` 之上), 也存在 `refs/upstream-sync/resume-done`
+- `SYNC_RESUME_FROM`: 从它之后(不含)的 main 提交还没重演
+- `SYNC_RESUME_STOPPED`: 上一轮卡在这个提交(为空 = rebase 已全部做完, 上一轮卡在对账/测试/构建)
+- `SYNC_RESUME_ATTEMPTS`: 第几次续跑
+
+**第 2 节换成下面这条**(只重演剩下的提交, 不要从头 `git rebase origin/main`):
+
+```bash
+git rebase --onto "$SYNC_RESUME_DONE" "$SYNC_RESUME_FROM" "syncing/$VER"
+```
+
+- 剩余为空时 rebase 直接把分支指到 `SYNC_RESUME_DONE`, 照常进入第 4 节对账。
+- `.sync-loop/resume-partial.diff` 若存在, 是上一轮在 `SYNC_RESUME_STOPPED` 上解到一半的冲突(含冲突标记),
+  **只作参考**, 照第 3 节重新解, 不要直接 apply。
+- 第 4 节对账照常对**全部**提交做(`pre-subjects` 取的是 `$BASE..main`, 已包含前几轮重演过的部分)。
+- 前几轮解过的冲突细节没有留存 —— 报告里如实写"续跑第 N 次, 前序轮次已完成 X 个提交的 rebase,
+  其冲突记录见 `.sync-loop/runs/` 里上一轮归档", 不要编造。
 
 ## 2. rebase
 
 - `REWRITTEN=false` 且 `git merge-base HEAD origin/main` 非空 → 常规:
 
 ```bash
-git rebase origin/main
+git rebase "${SYNC_TARGET:-origin/main}"
 ```
 
 - `REWRITTEN=true`(上游重写了历史) → 用 `--onto` 把我们的提交重演到新上游之上:
 
 ```bash
-git rebase --onto origin/main "$BASE" "syncing/$VER"
+git rebase --onto "${SYNC_TARGET:-origin/main}" "$BASE" "syncing/$VER"
 ```
 
 merge 提交会被自动丢弃 —— 这是**对的**, 因为那些 merge 只是把旧上游历史并进来, 现在由新上游取代。
@@ -82,16 +107,16 @@ grep -rn '^<<<<<<< \|^>>>>>>> ' --include='*.py' --include='*.ts' --include='*.t
 
 ```bash
 # a) 我们的提交一条都不能少(标题+数量)
-git log --no-merges --format=%s origin/main..HEAD > /tmp/post-subjects.txt
+git log --no-merges --format=%s "${SYNC_TARGET:-origin/main}"..HEAD > /tmp/post-subjects.txt
 diff /tmp/pre-subjects.txt /tmp/post-subjects.txt
 ```
 
-- 有缺失 → 查原因: `git log --oneline origin/main --grep=<缺失标题的关键词>`。若上游已独立实现了同一改动(提交变空被丢弃), 记为"上游已含", **继续**; 否则**停下**, 按失败处理。
+- 有缺失 → 查原因: `git log --oneline ${SYNC_TARGET:-origin/main} --grep=<缺失标题的关键词>`。若上游已独立实现了同一改动(提交变空被丢弃), 记为"上游已含", **继续**; 否则**停下**, 按失败处理。
 - 多出条目 → 停下, 说明 rebase 把不该带的提交带进来了。
 
 ```bash
 # b) 与上游的差异只应是我们预期的二开文件
-git diff --name-only origin/main HEAD
+git diff --name-only "${SYNC_TARGET:-origin/main}" HEAD
 ```
 
 - 出现没见过的文件 → 很可能是冲突解错或误带文件, **停下**。
@@ -154,10 +179,17 @@ git checkout main
 git branch -D "syncing/$VER"               # 工作分支使命完成; 版本由标签标记
 ```
 
-⚠ `refs/upstream-sync/last` 要记的是**上游**的 commit, 不是我们 rebase 后的提交 —— 记错会让下一轮闸门误判"上游重写了历史":
+⚠ `refs/upstream-sync/last` 要记的是**上游**的 commit(即同步目标 `$SYNC_TARGET`), 不是我们 rebase 后的提交 —— 记错会让下一轮闸门误判"上游重写了历史":
 
 ```bash
-git update-ref refs/upstream-sync/last "$(git rev-parse origin/main)"
+git update-ref refs/upstream-sync/last "$(git rev-parse ${SYNC_TARGET:-origin/main})"
+```
+
+清掉断点存档(不论本轮是不是续跑, 成功了就不该再留):
+
+```bash
+rm -f .sync-loop/resume.env .sync-loop/resume-partial.diff
+git update-ref -d refs/upstream-sync/resume-done 2>/dev/null || true
 ```
 
 保留 3 个版本: 旧的 `sync/<VER>` 标签只留最近 3 个(镜像标签由 `deploy.sh` 自动清理)。
@@ -201,15 +233,15 @@ bash scripts/upstream-sync/notify.sh --title "✅ 上游同步: 新增 <N> 项�
 
 ```bash
 # 1) 上游这轮改了哪些文件、哪些是新增功能
-git log --no-merges --format='%h %s' <上次同步点对应的上游提交>..origin/main
-git diff --name-only <上次同步点> origin/main
+git log --no-merges --format='%h %s' <上次同步点对应的上游提交>..${SYNC_TARGET:-origin/main}
+git diff --name-only <上次同步点> ${SYNC_TARGET:-origin/main}
 
 # 2) 上游的 README 差异 —— 上游会用"用户能做什么"的语言描述新功能, 直接借用最准
-git diff <上次同步点> origin/main -- README.md
+git diff <上次同步点> ${SYNC_TARGET:-origin/main} -- README.md
 
 # 3) 拿不准某个功能到底做了什么时, 看它的实际改动
 git show --stat <某个上游提交>
-git diff <上次同步点> origin/main -- <相关文件>
+git diff <上次同步点> ${SYNC_TARGET:-origin/main} -- <相关文件>
 ```
 
 ### 报告模板(飞书 markdown, **别用表格** —— 飞书卡片对表格支持差)
@@ -268,6 +300,7 @@ git diff <上次同步点> origin/main -- <相关文件>
 ## 9. 失败时
 
 - **rebase 冲突解不动 / 对账不过 / 测试红** → `git rebase --abort`(或 `git checkout main && git branch -D "syncing/$VER"`), 线上与 `main` 原封不动。发一条 `--level warn` 通知, 说清卡在哪一步、需要你决定什么, 状态文件写 `"result": "needs_human"`。
+  续跑轮里失败同样要清掉断点存档(见第 7 节那两条命令) —— 存档的进度已被证明有问题, 下一轮应从头来。
 - **部署失败** → `deploy.sh` 已经自动回退并自己发了告警, 你只需在报告里补充冲突/测试结论。
 - **上游重写历史且 `BASE` 找不到** → 停下问人, 别猜着 rebase。
 - **命令被权限拒绝** → 状态文件写 `"result": "blocked_by_permissions"` 并在 `reason` 里写清是哪一步、
